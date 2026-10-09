@@ -49,13 +49,27 @@ WantedBy=default.target
 
 
 def _launch_command(minimized: bool = True) -> str:
-    """返回用于自启动的命令行字符串。"""
-    if getattr(sys, "frozen", False):  # PyInstaller 打包
+    """返回用于自启动的命令行字符串。
+
+    注意：不能用 ``python3 -m wallpaper_changer`` —— 以 deb 安装到
+    /opt 后，开机自启动时的工作目录不是项目根，该模块无法被导入，
+    自启动会静默失败。这里按优先级选择真正可用的启动方式。
+    """
+    args = " --minimized" if minimized else ""
+    if getattr(sys, "frozen", False):      # PyInstaller 打包
         exe = sys.executable
     else:
-        exe = f'{sys.executable} -m wallpaper_changer'
-    args = " --minimized" if minimized else ""
-    return f'"{exe}"{args}' if " " in str(exe) else f"{exe}{args}"
+        launcher = shutil.which(APP_NAME)  # deb / AppImage 安装后的启动器
+        main_py = Path(__file__).resolve().parent.parent / "main.py"
+        if launcher:
+            exe = launcher
+        elif main_py.exists():              # 源码运行：直接用绝对路径
+            path = str(main_py)
+            exe = f'{sys.executable} "{path}"' if " " in path \
+                else f"{sys.executable} {path}"
+        else:
+            exe = f"{sys.executable} -m wallpaper_changer"
+    return f"{exe}{args}"
 
 
 # --------------------------------------------------------------------------- #
@@ -80,7 +94,7 @@ def icon_path() -> str:
     candidates = [
         Path.home() / ".local" / "share" / "icons" / "hicolor" / "256x256" / "apps" / f"{APP_NAME}.png",
         Path("/usr/share/pixmaps") / f"{APP_NAME}.png",
-        Path(__file__).resolve().parent.parent / "assets" / "icon.png",
+        Path(__file__).resolve().parent.parent.parent / "assets" / "icon.png",
     ]
     for c in candidates:
         if c.exists():

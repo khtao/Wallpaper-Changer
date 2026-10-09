@@ -1,0 +1,307 @@
+# 修复：config.json 里数值被存成字符串导致 QSpinBox.setValue(str) 崩溃
+# 根因：读取配置时未做类型转换；同时损坏的 JSON 会让程序无法启动
+# 应用： patch -p1 < fix-config-type.patch   （在项目根目录执行）
+--- a/wallpaper_changer/config.py	2026-10-09 16:28:19.000000000 +0800
++++ b/wallpaper_changer/config.py	2026-10-09 20:25:10.000000000 +0800
+@@ -7,11 +7,12 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import os
+ import sys
+ from dataclasses import asdict, dataclass, field
+ from pathlib import Path
+-from typing import Any, Dict, List
++from typing import Any, Dict, List, get_origin, get_type_hints
+ 
+ APP_NAME = "wallpaper-changer"
+ APP_TITLE = "Wallpaper Changer"
+@@ -21,6 +22,8 @@
+ IS_WINDOWS = sys.platform.startswith("win")
+ IS_LINUX = sys.platform.startswith("linux")
+ 
++LOG = logging.getLogger(__name__)
++
+ 
+ def app_data_dir() -> Path:
+     """返回应用数据目录（壁纸缓存、数据库、日志）。"""
+@@ -136,14 +139,58 @@
+     theme: str = "跟随系统"  # 跟随系统 / 浅色 / 深色
+ 
+ 
++def _coerce(value: Any, annotation: Any, default: Any) -> Any:
++    """把 JSON 里的值强制转换为字段声明的类型。
++
++    手工编辑 config.json、或旧版本残留都可能写入字符串型数字
++    （如 "count": "8"），直接传给 QSpinBox.setValue 会抛 TypeError，
++    这里统一在读取阶段纠正。
++    """
++    if value is None:
++        return default
++
++    origin = get_origin(annotation)
++    # List[str] / List[int] ...
++    if origin in (list, List):
++        if isinstance(value, (list, tuple)):
++            return [str(v) for v in value]
++        if isinstance(value, str):
++            return [value] if value.strip() else []
++        return default if isinstance(default, list) else []
++
++    # bool 必须排在 int 之前判断（bool 是 int 的子类）
++    if annotation is bool:
++        if isinstance(value, bool):
++            return value
++        if isinstance(value, str):
++            return value.strip().lower() in ("1", "true", "yes", "on")
++        return bool(value)
++
++    if annotation is int:
++        try:
++            return int(str(value).strip())
++        except (TypeError, ValueError):
++            return default if isinstance(default, int) else 0
++
++    if annotation is str:
++        return value if isinstance(value, str) else str(value)
++
++    return value
++
++
+ def _from_dict(cls, data: Dict[str, Any]):
+-    """用（可能不完整的）字典构造 dataclass，保持默认值。"""
++    """用（可能不完整或类型不严谨的）字典构造 dataclass，保持默认值。"""
+     if not isinstance(data, dict):
+         return cls()
++    try:
++        hints = get_type_hints(cls)
++    except Exception:  # noqa: BLE001 - 取不到注解就退化为原样赋值
++        hints = {}
+     kwargs = {}
+     for f in cls.__dataclass_fields__.values():  # type: ignore[attr-defined]
+         if f.name in data:
+-            kwargs[f.name] = data[f.name]
++            default = getattr(cls(), f.name, f.default)
++            kwargs[f.name] = _coerce(data[f.name], hints.get(f.name, type(default)), default)
+     return cls(**kwargs)
+ 
+ 
+@@ -158,10 +205,20 @@
+         if self.path.exists():
+             try:
+                 raw = json.loads(self.path.read_text(encoding="utf-8"))
+-            except Exception:
++            except Exception as exc:  # noqa: BLE001
++                # 配置文件损坏时备份一份，再用默认设置启动，避免程序打不开
++                LOG.warning("配置文件解析失败（%s），已备份并使用默认设置", exc)
++                try:
++                    backup = self.path.with_suffix(
++                        self.path.suffix + ".broken")
++                    self.path.replace(backup)
++                except OSError:
++                    pass
+                 raw = {}
+         else:
+             raw = {}
++        if not isinstance(raw, dict):
++            raw = {}
+         self.data = AppSettings(
+             bing=_from_dict(BingSettings, raw.get("bing", {})),
+             openverse=_from_dict(OpenverseSettings, raw.get("openverse", {})),
+@@ -169,7 +226,11 @@
+             custom_urls=_from_dict(CustomUrlSettings, raw.get("custom_urls", {})),
+             rotation=_from_dict(RotationSettings, raw.get("rotation", {})),
+         )
+-        # 顶层标量
++        # 顶层标量（同样按声明类型纠正）
++        try:
++            hints = get_type_hints(AppSettings)
++        except Exception:  # noqa: BLE001
++            hints = {}
+         for key in (
+             "cache_dir",
+             "max_cache_files",
+@@ -182,7 +243,9 @@
+             "theme",
+         ):
+             if key in raw:
+-                setattr(self.data, key, raw[key])
++                default = getattr(AppSettings(), key)
++                setattr(self.data, key,
++                        _coerce(raw[key], hints.get(key, type(default)), default))
+         if not self.data.cache_dir:
+             self.data.cache_dir = str(default_cache_dir())
+ 
+--- a/wallpaper_changer/ui/main_window.py	2026-10-09 16:28:48.000000000 +0800
++++ b/wallpaper_changer/ui/main_window.py	2026-10-09 20:26:52.000000000 +0800
+@@ -377,55 +377,77 @@
+     # ------------------------------------------------------------------ #
+     # 设置读写
+     # ------------------------------------------------------------------ #
++    @staticmethod
++    def _set_int(widget, value, fallback: int = 0) -> None:
++        """安全写入数值控件：配置里即使存成了字符串也不会崩。"""
++        try:
++            widget.setValue(int(value))
++        except (TypeError, ValueError):
++            widget.setValue(fallback)
++
++    @staticmethod
++    def _set_text(widget, value, fallback: str = "") -> None:
++        widget.setText(str(value) if value is not None else fallback)
++
++    @staticmethod
++    def _set_checked(widget, value, fallback: bool = False) -> None:
++        widget.setChecked(bool(value) if isinstance(value, (bool, int, str)) else fallback)
++
++    def _set_combo(self, combo, value, fallback_index: int = 0) -> None:
++        text = str(value) if value is not None else ""
++        idx = combo.findText(text)
++        combo.setCurrentIndex(idx if idx >= 0 else fallback_index)
++
+     def _load_settings(self) -> None:
+         d = self.config.data
+         r = d.rotation
+-        self.chk_enabled.setChecked(r.enabled)
+-        if r.interval_minutes >= 60 and r.interval_minutes % 60 == 0:
+-            self.combo_unit.setCurrentText("小时")
+-            self.spin_interval.setValue(r.interval_minutes / 60)
++        self._set_checked(self.chk_enabled, r.enabled, True)
++        try:
++            minutes = int(r.interval_minutes)
++        except (TypeError, ValueError):
++            minutes = 30
++        if minutes >= 60 and minutes % 60 == 0:
++            self._set_combo(self.combo_unit, "小时")
++            self._set_int(self.spin_interval, minutes / 60, 1)
+         else:
+-            self.combo_unit.setCurrentText("分钟")
+-            self.spin_interval.setValue(r.interval_minutes)
+-        self.chk_start_change.setChecked(r.on_startup_change)
+-        self.chk_random.setChecked(r.random_order)
+-        self.spin_avoid.setValue(r.avoid_repeat_days)
+-        if r.fit_mode in [self.combo_fit.itemText(i) for i in range(self.combo_fit.count())]:
+-            self.combo_fit.setCurrentText(r.fit_mode)
+-        self.chk_dark.setChecked(r.set_dark_variant)
+-        self.spin_minw.setValue(r.min_width)
+-        self.spin_minh.setValue(r.min_height)
+-        self.spin_timeout.setValue(r.timeout)
+-
+-        self.gb_bing.setChecked(d.bing.enabled)
+-        self.combo_market.setCurrentText(d.bing.market)
+-        self.spin_bing_count.setValue(d.bing.count)
+-        self.combo_bing_res.setCurrentText(d.bing.resolution)
+-        self.gb_openverse.setChecked(d.openverse.enabled)
+-        self.edit_query.setText(d.openverse.query)
+-        self.edit_license.setText(d.openverse.license)
+-        self.spin_ov_size.setValue(d.openverse.page_size)
+-        self.edit_ov_source.setText(d.openverse.source)
+-        self.edit_ov_token.setText(d.openverse.token)
+-        self.chk_mature.setChecked(d.openverse.mature)
+-        self.gb_local.setChecked(d.local.enabled)
++            self._set_combo(self.combo_unit, "分钟")
++            self._set_int(self.spin_interval, minutes, 30)
++        self._set_checked(self.chk_start_change, r.on_startup_change, True)
++        self._set_checked(self.chk_random, r.random_order, True)
++        self._set_int(self.spin_avoid, r.avoid_repeat_days, 7)
++        self._set_combo(self.combo_fit, r.fit_mode)
++        self._set_checked(self.chk_dark, r.set_dark_variant, True)
++        self._set_int(self.spin_minw, r.min_width, 1280)
++        self._set_int(self.spin_minh, r.min_height, 720)
++        self._set_int(self.spin_timeout, r.timeout, 20)
++
++        self._set_checked(self.gb_bing, d.bing.enabled, True)
++        self._set_combo(self.combo_market, d.bing.market)
++        self._set_int(self.spin_bing_count, d.bing.count, 8)
++        self._set_combo(self.combo_bing_res, d.bing.resolution)
++        self._set_checked(self.gb_openverse, d.openverse.enabled, True)
++        self._set_text(self.edit_query, d.openverse.query)
++        self._set_text(self.edit_license, d.openverse.license)
++        self._set_int(self.spin_ov_size, d.openverse.page_size, 30)
++        self._set_text(self.edit_ov_source, d.openverse.source)
++        self._set_text(self.edit_ov_token, d.openverse.token)
++        self._set_checked(self.chk_mature, d.openverse.mature, False)
++        self._set_checked(self.gb_local, d.local.enabled, False)
+         self.list_dirs.clear()
+-        self.list_dirs.addItems(d.local.directories)
+-        self.chk_recursive.setChecked(d.local.recursive)
+-        self.gb_urls.setChecked(d.custom_urls.enabled)
+-        self.edit_urls.setPlainText("\n".join(d.custom_urls.urls))
+-
+-        self.chk_autostart.setChecked(d.autostart)
+-        self.chk_start_min.setChecked(d.start_minimized)
+-        self.chk_close_tray.setChecked(d.close_to_tray)
+-        self.chk_notify.setChecked(d.show_notifications)
+-        self.edit_cache.setText(d.cache_dir)
+-        self.spin_cache_files.setValue(d.max_cache_files)
+-        self.edit_proxy.setText(d.proxy)
+-        if d.log_level in [self.combo_log.itemText(i) for i in range(self.combo_log.count())]:
+-            self.combo_log.setCurrentText(d.log_level)
+-        if d.theme in [self.combo_theme.itemText(i) for i in range(self.combo_theme.count())]:
+-            self.combo_theme.setCurrentText(d.theme)
++        self.list_dirs.addItems([str(x) for x in (d.local.directories or [])])
++        self._set_checked(self.chk_recursive, d.local.recursive, True)
++        self._set_checked(self.gb_urls, d.custom_urls.enabled, False)
++        self.edit_urls.setPlainText("\n".join(str(u) for u in (d.custom_urls.urls or [])))
++
++        self._set_checked(self.chk_autostart, d.autostart, False)
++        self._set_checked(self.chk_start_min, d.start_minimized, True)
++        self._set_checked(self.chk_close_tray, d.close_to_tray, True)
++        self._set_checked(self.chk_notify, d.show_notifications, True)
++        self._set_text(self.edit_cache, d.cache_dir)
++        self._set_int(self.spin_cache_files, d.max_cache_files, 300)
++        self._set_text(self.edit_proxy, d.proxy)
++        self._set_combo(self.combo_log, d.log_level, 1)      # 默认 INFO
++        self._set_combo(self.combo_theme, d.theme)
+         self._update_cache_label()
+ 
+     def _collect_settings(self) -> None:
+@@ -657,6 +679,13 @@
+             return
+         event.accept()
+ 
++    def shutdown(self) -> None:
++        """退出前停掉界面侧的后台线程。"""
++        for view in (getattr(self, "fav_view", None), getattr(self, "hist_view", None)):
++            if view is not None:
++                view.shutdown()
++
+     def really_quit(self) -> None:
+         self._closing = True
++        self.shutdown()
+         self.close()
+--- a/wallpaper_changer/ui/gallery.py	2026-10-09 16:24:14.000000000 +0800
++++ b/wallpaper_changer/ui/gallery.py	2026-10-09 20:26:48.000000000 +0800
+@@ -125,8 +125,15 @@
+ 
+     # ---------- 数据 ----------
+     def reload(self) -> None:
+-        """由外部传入数据后调用 set_records；这里仅触发信号。"""
+-        self.reloadRequested.emit() if hasattr(self, "reloadRequested") else None
++        """通知宿主重新查询数据（宿主再调用 set_records）。"""
++        self.reloadRequested.emit()
++
++    def shutdown(self) -> None:
++        """退出前停掉后台缩略图线程，避免出现“线程仍在运行”的告警。"""
++        loader = self._loader
++        if loader is not None and loader.isRunning():
++            loader.stop()
++            loader.wait(2000)
+ 
+     def set_records(self, records: List[ImageRecord]) -> None:
+         if self._loader and self._loader.isRunning():
+--- a/wallpaper_changer/app.py	2026-10-09 17:22:18.000000000 +0800
++++ b/wallpaper_changer/app.py	2026-10-09 20:26:55.000000000 +0800
+@@ -248,6 +248,11 @@
+ 
+     def quit(self) -> None:
+         LOG.info("退出应用")
++        if self.window is not None and hasattr(self.window, "shutdown"):
++            try:
++                self.window.shutdown()
++            except Exception:  # noqa: BLE001
++                pass
+         if self.engine:
+             self.engine.shutdown() if hasattr(self.engine, "shutdown") else None
+         if self._server:

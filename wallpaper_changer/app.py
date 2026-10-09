@@ -118,6 +118,8 @@ class Application(QObject):
         p.add_argument("--quit", action="store_true", help="通知已运行的实例退出")
         p.add_argument("--show", action="store_true", help="显示已运行实例的界面")
         p.add_argument("--no-tray", action="store_true", help="不创建托盘图标")
+        p.add_argument("--doctor", action="store_true",
+                       help="环境自检：打印依赖、目录权限与桌面环境信息")
         p.add_argument("--log-level", dest="log_level", default=None,
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
         return p.parse_args(args)
@@ -381,6 +383,12 @@ def main(argv: list[str] | None = None) -> int:
         args = Application._parse_args(argv[1:])
     except SystemExit as exc:               # --help 等
         return int(exc.code or 0)
+
+    if args.doctor:
+        # 真正的自检在 doctor.py（不依赖 PySide6，缺依赖时也能跑）
+        from .doctor import run_doctor
+
+        return run_doctor()
 
     if args.log_level:
         logging.getLogger().setLevel(getattr(logging, args.log_level, logging.INFO))

@@ -25,13 +25,22 @@
 ### Linux（Ubuntu 26.04）
 
 ```bash
-sudo apt install python3-pyside6.qtwidgets python3-requests python3-pil
-pip install -r requirements.txt          # 或用系统包，二选一
-python main.py                            # 启动
+# 安装依赖（pip 与 apt 二选一，见下方说明）
+python3 -m pip install --break-system-packages -r requirements.txt
+
+python main.py                            # 启动界面
 python main.py --minimized                # 只驻留托盘
+python main.py --doctor                   # 环境自检（推荐先跑一次）
 ```
 
-> Ubuntu 26.04 建议优先使用系统包 `python3-pyside6.qtwidgets`，避免 pip 版本与系统 Qt 冲突。
+> 两种装法都行，选一种即可：
+>
+> - **pip（推荐，不依赖发行版仓库）**：`python3 -m pip install --break-system-packages -r requirements.txt`
+>   （Ubuntu 23.04+ 因 PEP 668 需要 `--break-system-packages`；若提示 pip 不存在，先 `sudo apt install python3-pip`）
+> - **apt（需启用 universe）**：`sudo add-apt-repository universe && sudo apt update && sudo apt install python3-pyside6.qtwidgets python3-pyside6.qtnetwork python3-requests python3-pil`
+>
+> apt 装的 PySide6 与 pip 装的互不可见：用 apt 装就统一走 apt，用 pip 装就统一走 pip，不要混用。
+> 装完可用 `python3 main.py --doctor` 复核环境。
 
 ### Windows
 
@@ -42,7 +51,7 @@ python main.py
 
 ### 运行截图
 
-![image-20261009212602808](./docs/screenshot-main.png)
+![主界面](docs/screenshot-main.png)
 
 ---
 
@@ -87,12 +96,22 @@ wallpaper-changer/
 ### 1) Debian / Ubuntu（.deb）
 
 ```bash
-bash packaging/linux/build-deb.sh 1.0.0        # 生成 dist/wallpaper-changer_1.0.0_all.deb
-sudo apt install ./dist/wallpaper-changer_1.0.0_all.deb
+# 轻量包（约 77K，依赖系统已有的 Python + PySide6）
+bash packaging/linux/build-deb.sh 1.0.1
+sudo apt install ./dist/wallpaper-changer_1.0.1_all.deb
+
+# 自包含包（约 59M，内置 PySide6 / requests / Pillow，不依赖系统 Qt 包）
+bash packaging/linux/build-deb.sh 1.0.1 --bundle
+sudo apt install ./dist/wallpaper-changer_1.0.1_all.deb
 ```
 
-产物包含 `/opt/wallpaper-changer`、`/usr/bin/wallpaper-changer` 启动器、菜单项与图标。
-脚本会自动检测文件系统是否支持 `chmod`，不支持时改用临时目录构建。
+安装后若有问题，先跑自检：
+
+```bash
+wallpaper-changer --doctor
+```
+
+它会逐项列出依赖、目录权限、图标与壁纸后端，并给出 apt 与 pip 两种修复命令。
 
 ### 2) AppImage（免安装、跨发行版）
 
@@ -190,6 +209,8 @@ python tests/test_ui_smoke.py    # 界面与引擎冒烟（offscreen，无需真
 尺寸过滤、缓存落盘与清理、自定义链接（含 JSON 接口解析）、Linux `gsettings` 命令拼装、缺失文件处理。
 
 冒烟测试覆盖：本地来源抓取 → 候选池生成 → 切换与失败重试 → 收藏/历史 → 六个配置页切换 → 图标加载。
+
+---
 
 ## 九、扩展新的图片来源
 

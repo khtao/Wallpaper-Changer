@@ -8,7 +8,13 @@ from PySide6.QtCore import Qt
 
 
 def assets_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "assets"
+    """返回项目 assets 目录。
+
+    本文件位于 <项目根>/wallpaper_changer/ui/icons.py，
+    所以项目根是 parent(ui) -> parent(wallpaper_changer) -> parent(根)。
+    早期版本少了一级，导致 deb 安装后（尤其从 /opt 运行时）找不到图标。
+    """
+    return Path(__file__).resolve().parent.parent.parent / "assets"
 
 
 def icon_file() -> Path:
