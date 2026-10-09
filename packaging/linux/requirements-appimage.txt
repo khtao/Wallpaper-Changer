@@ -1,0 +1,4 @@
+# AppImage 专用依赖清单：只装 Qt  essentials，显著减小体积
+PySide6-Essentials>=6.6,<7
+requests>=2.31
+Pillow>=10.0

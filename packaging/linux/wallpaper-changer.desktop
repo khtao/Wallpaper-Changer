@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Wallpaper Changer
+GenericName=壁纸轮换器
+Comment=自动从 Bing、本地文件夹或自定义链接更换桌面壁纸
+Exec=wallpaper-changer
+Icon=wallpaper-changer
+Terminal=false
+Categories=Utility;Settings;DesktopSettings;
+StartupNotify=false
+Keywords=wallpaper;background;bing;
