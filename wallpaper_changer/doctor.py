@@ -93,6 +93,23 @@ def run_doctor() -> int:
             missing_apt.append(apt_pkg)
             missing_pip.append(pip_pkg)
 
+    print("\n-- 自动轮换 --")
+    try:
+        from .config import Config
+
+        rot = Config().data.rotation
+        enabled = bool(rot.enabled) and rot.interval_minutes > 0
+        ok &= _check("启用自动轮换", enabled,
+                     f"每 {rot.interval_minutes} 分钟" if enabled
+                     else f"未启用（enabled={rot.enabled}, 间隔={rot.interval_minutes} 分钟）")
+        if not enabled:
+            print("    → 倒计时不会启动。请在「轮换」页勾选「启用自动轮换」并保存；")
+            print("      若该选项之前被取消，多半是旧版本把「暂停」误写成了长期关闭。")
+        ok &= _check("启动即换一张", rot.on_startup_change,
+                     "开" if rot.on_startup_change else "关")
+    except Exception as exc:  # noqa: BLE001
+        ok &= _check("读取轮换配置", False, f"{type(exc).__name__}: {exc}")
+
     print("\n-- 目录与权限 --")
     for label, path in (("配置目录", config_dir()), ("数据目录", app_data_dir())):
         try:

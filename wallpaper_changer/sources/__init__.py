@@ -14,12 +14,11 @@ REGISTRY: Dict[str, Type[Source]] = {
     CustomUrlSource.name: CustomUrlSource,
 }
 
-# 显示名映射。保留历史来源名，便于旧记录仍能正常显示来源标签。
+# 显示名映射（来源名 -> 界面显示名）
 SOURCE_LABELS: Dict[str, str] = {
     BingSource.name: BingSource.label,
     LocalSource.name: LocalSource.label,
     CustomUrlSource.name: CustomUrlSource.label,
-    "openverse": "Openverse（已移除）",
 }
 
 

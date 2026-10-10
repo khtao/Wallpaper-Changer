@@ -134,6 +134,9 @@ class MainWindow(QMainWindow):
         g = QGroupBox("定时轮换")
         f = QFormLayout(g)
         self.chk_enabled = QCheckBox("启用自动轮换")
+        self.chk_enabled.setToolTip("勾选后倒计时立即开始；取消则停止。需点「保存并应用」才会长期生效。")
+        # 勾选/取消即时启停倒计时，不必等保存
+        self.chk_enabled.toggled.connect(self._on_enabled_toggled)
         self.spin_interval = QDoubleSpinBox()
         self.spin_interval.setRange(0.5, 1440)
         self.spin_interval.setDecimals(1)
@@ -190,10 +193,27 @@ class MainWindow(QMainWindow):
         self.label_pool = QLabel("—")
         self.label_desk = QLabel(detect_desktop() if not IS_WINDOWS else "Windows")
         self.label_screen = QLabel(screen_info())
+        self.btn_pause = QPushButton("暂停")
+        self.btn_pause.setCheckable(True)
+        self.btn_pause.setChecked(False)
+        self.btn_pause.setToolTip(
+            "暂停仅作用于本次运行；重启程序会按配置自动开始倒计时。\n"
+            "要长期关闭，请取消上方「启用自动轮换」。")
+        self.btn_pause.toggled.connect(self._toggle_pause)
+        self.btn_next_now = QPushButton("立即切换")
+        self.btn_next_now.setToolTip("不等倒计时，马上换一张")
+        self.btn_next_now.clicked.connect(lambda: self.engine.change_next("手动"))
+        row_state = QHBoxLayout()
+        row_state.addWidget(self.btn_pause)
+        row_state.addWidget(self.btn_next_now)
+        row_state.addStretch(1)
+        w_state = QWidget()
+        w_state.setLayout(row_state)
         f2.addRow("桌面环境：", self.label_desk)
         f2.addRow("屏幕：", self.label_screen)
         f2.addRow("候选池：", self.label_pool)
         f2.addRow("下次切换：", self.label_next)
+        f2.addRow(w_state)
         lay.addWidget(g2)
         lay.addStretch(1)
         return w
@@ -265,7 +285,9 @@ class MainWindow(QMainWindow):
         self.chk_autostart = QCheckBox("开机自动启动")
         self.chk_start_min = QCheckBox("开机启动时最小化到托盘")
         self.chk_close_tray = QCheckBox("关闭窗口时最小化到托盘（不退出）")
-        self.chk_notify = QCheckBox("换图时显示桌面通知")
+        self.chk_notify = QCheckBox("出错时显示桌面通知")
+        self.chk_notify.setToolTip(
+            "仅在切换失败或发生严重错误时弹出通知；换图成功、收藏等日常操作不会打扰你。")
         self.chk_systemd = QCheckBox("Linux：使用 systemd --user 而不是 XDG autostart")
         f.addRow(self.chk_autostart)
         f.addRow(self.chk_start_min)
@@ -313,13 +335,9 @@ class MainWindow(QMainWindow):
         v3 = QHBoxLayout(g3)
         self.btn_clear_history = QPushButton("清空历史记录")
         self.btn_clear_history.clicked.connect(self._clear_history)
-        self.btn_purge_openverse = QPushButton("清理 Openverse 旧记录")
-        self.btn_purge_openverse.setToolTip("Openverse 来源已移除，可清理此前保存的图片与历史")
-        self.btn_purge_openverse.clicked.connect(self._purge_openverse)
         self.btn_reset = QPushButton("恢复默认设置")
         self.btn_reset.clicked.connect(self._reset_settings)
         v3.addWidget(self.btn_clear_history)
-        v3.addWidget(self.btn_purge_openverse)
         v3.addWidget(self.btn_reset)
         v3.addStretch(1)
         lay.addWidget(g3)
@@ -529,20 +547,6 @@ class MainWindow(QMainWindow):
             self._load_settings()
             self.engine.reload()
 
-    def _purge_openverse(self) -> None:
-        """删除已移除来源（Openverse）留下的图片与历史。"""
-        n = self.db.count_by_source("openverse")
-        if n == 0:
-            QMessageBox.information(self, "无需清理", "没有 Openverse 的记录")
-            return
-        if QMessageBox.question(
-            self, "确认", f"删除 {n} 条 Openverse 记录及其历史？此操作不可撤销。"
-        ) != QMessageBox.Yes:
-            return
-        removed = self.db.delete_by_source("openverse")
-        self.refresh_views()
-        QMessageBox.information(self, "完成", f"已删除 {removed} 条记录")
-
     def _delete_record(self, rec: ImageRecord) -> None:
         if QMessageBox.question(self, "确认", f"从库中删除「{rec.display_title}」？") != QMessageBox.Yes:
             return
@@ -556,15 +560,8 @@ class MainWindow(QMainWindow):
         self.refresh_views()
 
     def hide_to_tray(self) -> None:
+        # 静默隐藏到托盘：不再弹「已最小化」通知
         self.hide()
-        tray = getattr(self.ctx, "tray", None)
-        if tray is None:
-            return
-        # 统一走 TrayIcon.info()：不要在托盘实例上直接取枚举属性
-        try:
-            tray.info("已最小化到托盘，双击图标打开界面", 2500)
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("托盘通知失败：%s", exc)
 
     def refresh_views(self) -> None:
         self.gallery.set_records(self._records_for(self.gallery))
@@ -620,8 +617,7 @@ class MainWindow(QMainWindow):
             if not pix.isNull():
                 self.preview.setPixmap(pix.scaled(
                     self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        if self.config.data.show_notifications and hasattr(self.ctx, "tray") and self.ctx.tray:
-            self.ctx.tray.notify(rec)
+        # 换图成功不再弹桌面通知（已按需求收敛为：仅在失败/严重错误时通知）
         if self.tabs.tabText(self.tabs.currentIndex()) == "图库":
             self.refresh_views()
 
@@ -632,16 +628,39 @@ class MainWindow(QMainWindow):
     def _on_failed(self, text: str) -> None:
         self.label_status.setText(f"⚠ {text}")
         self.append_log(f"[错误] {text}")
+        # 仅在失败 / 严重错误时弹桌面通知（成功换图、收藏等一律不打扰）
+        if self.config.data.show_notifications:
+            tray = getattr(self.ctx, "tray", None)
+            if tray is not None:
+                tray.error(text)
 
     def append_log(self, text: str) -> None:
         import time as _t
 
         self.log_view.appendPlainText(f"[{_t.strftime('%H:%M:%S')}] {text}")
 
+    def _on_enabled_toggled(self, checked: bool) -> None:
+        """「启用自动轮换」勾选状态变化时立即启停倒计时。"""
+        self.config.data.rotation.enabled = bool(checked)
+        self.engine.apply_timer()
+        self._update_countdown()
+
+    def _toggle_pause(self, checked: bool) -> None:
+        """暂停 / 继续倒计时（运行时，不落盘）。"""
+        self.engine.pause(checked)
+        self.btn_pause.setText("继续" if checked else "暂停")
+        self._update_countdown()
+
     def _update_countdown(self) -> None:
         secs = self.engine.seconds_to_next()
         if secs < 0:
-            self.label_next.setText("已暂停")
+            # 区分两种「不走」的原因，避免误以为程序坏了
+            if self.engine.is_paused():
+                self.label_next.setText("已暂停（点「继续」恢复）")
+            elif not self.engine.rotation_enabled():
+                self.label_next.setText("未启用自动轮换")
+            else:
+                self.label_next.setText("—")
         else:
             m, s = divmod(secs, 60)
             h, m = divmod(m, 60)

@@ -225,12 +225,32 @@ class Application(QObject):
             return self._run_headless(qt_app)
 
         self.window = MainWindow(self)
+        # 首页直接显示「当前壁纸」：从历史里恢复上一次成功设置的记录
+        restored = self.engine.restore_current()
+        if restored:
+            LOG.info("已恢复当前壁纸显示：%s", restored.display_title)
+        else:
+            LOG.info("尚无历史记录，首页显示未设置壁纸")
         if not self.args.no_tray:
             self.tray = TrayIcon(self)
         if not self.args.minimized and not self.config.data.start_minimized:
             self.window.show()
         else:
             LOG.info("以最小化方式启动")
+
+        # 关键：启动后显式按配置装好倒计时。
+        # 暂停只是运行时状态（不落盘），因此每次启动都会回到配置里的
+        # 真实状态 —— 默认是「自动切换」。
+        rot = self.config.data.rotation
+        self.engine.pause(False)
+        self.engine.apply_timer()
+        if self.engine.rotation_enabled():
+            LOG.info("自动轮换已启动：每 %s 分钟切换一张（%s 秒后首次切换）",
+                     rot.interval_minutes, self.engine.seconds_to_next())
+        else:
+            LOG.warning("自动轮换未启用（rot.enabled=%s, interval=%s）："
+                        "倒计时不会启动，如需自动切换请在「轮换」页勾选「启用自动轮换」",
+                        rot.enabled, rot.interval_minutes)
 
         if self.config.data.rotation.on_startup_change:
             self.engine.change_next("启动")
@@ -334,9 +354,7 @@ class Application(QObject):
         if self.window:
             self.window.btn_fav.setText("★ 取消收藏" if fav else "★ 收藏")
             self.window.refresh_views()
-        if self.tray:
-            # 用 TrayIcon 提供的统一入口，避免在实例上取枚举属性
-            self.tray.info("已加入收藏" if fav else "已取消收藏", 2000)
+        # 收藏成功不再弹桌面通知（界面按钮文字与状态栏已给出反馈）
 
     def install_shortcuts(self) -> None:
         """安装应用菜单项与图标（Linux）。"""

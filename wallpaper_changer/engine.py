@@ -95,6 +95,9 @@ class Engine(QObject):
         self._refreshing = False
         self._applying = False
         self._favorite_only = False
+        # 运行时暂停：默认 False，即启动后自动开始倒计时。
+        # 不写入配置，保证「开机启动 = 自动切换」。
+        self._paused = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(lambda: self.change_next(reason="定时"))
         self._tasks: List[QThread] = []
@@ -103,8 +106,14 @@ class Engine(QObject):
 
     # ---------- 定时器 ----------
     def apply_timer(self) -> None:
+        """按配置（重新）启动倒计时。
+
+        注意：「暂停」是运行时状态（self._paused），**不写入配置文件**，
+        因此每次启动都会回到配置里的真实状态（默认自动切换）。
+        长期开关请用界面上的「启用自动轮换」。
+        """
         rot = self.config.data.rotation
-        if rot.enabled and rot.interval_minutes > 0:
+        if rot.enabled and rot.interval_minutes > 0 and not self._paused:
             self._timer.setInterval(int(rot.interval_minutes * 60 * 1000))
             self._timer.start()
         else:
@@ -115,10 +124,26 @@ class Engine(QObject):
             return -1
         return int(self._timer.remainingTime() / 1000)
 
+    def is_paused(self) -> bool:
+        """是否处于运行时暂停（不持久化）。"""
+        return self._paused
+
+    def rotation_enabled(self) -> bool:
+        """配置里是否启用了自动轮换（长期开关，持久化）。"""
+        rot = self.config.data.rotation
+        return bool(rot.enabled) and rot.interval_minutes > 0
+
     def pause(self, paused: bool) -> None:
-        if paused:
+        """暂停 / 继续倒计时。
+
+        只改运行时状态并同步计时器，不落盘，
+        避免「暂停过一次 → 配置被写成永久关闭 → 每次开机都暂停」。
+        """
+        self._paused = bool(paused)
+        if self._paused:
             self._timer.stop()
         else:
+            # 若配置层面没启用，继续也没意义，保持停止
             self.apply_timer()
 
     # ---------- 候选池 ----------
@@ -164,6 +189,20 @@ class Engine(QObject):
         self.refresh_finished.emit(len(self.pool), error)
 
     # ---------- 切换 ----------
+    def restore_current(self) -> Optional[ImageRecord]:
+        """启动时把「上一次成功设置的壁纸」恢复为当前壁纸。
+
+        只更新内部状态并发 changed 信号（供界面回显标题 / 预览 / 收藏按钮），
+        不重新设置系统壁纸、不触发通知。
+        """
+        rec = self.db.last_applied_record()
+        if rec is None:
+            return None
+        self.current = rec
+        self.changed.emit(rec)
+        self.status.emit(f"当前壁纸：{rec.display_title}")
+        return rec
+
     def change_next(self, reason: str = "手动", favorite_only: bool | None = None) -> None:
         if favorite_only is not None:
             self._favorite_only = favorite_only
@@ -208,8 +247,15 @@ class Engine(QObject):
         self.current = rec
         self.changed.emit(rec)
         self.status.emit(f"已应用：{rec.display_title}（{rec.source}）")
+        # 换完一张就从头开始计时，避免刚换完没多久又被自动换掉
+        self.restart_timer()
         if len(self.pool) < 3:
             self.refresh_pool(force=True)
+
+    def restart_timer(self) -> None:
+        """让自动切换的倒计时从头开始计时。"""
+        if self.rotation_enabled() and not self._paused:
+            self._timer.start()
 
     def change_prev(self) -> None:
         """回到上一张（历史栈）。"""

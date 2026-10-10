@@ -9,14 +9,14 @@ from typing import Optional
 class ImageRecord:
     """一张壁纸的元数据。"""
 
-    source: str                 # bing / openverse / local / custom_urls
+    source: str                 # bing / local / custom_urls
     source_id: str              # 来源侧唯一 ID（本地为文件绝对路径）
     remote_url: str = ""        # 远程下载地址（本地为空）
     local_path: str = ""        # 本机已落盘的图片路径
     title: str = ""
     author: str = ""
     license: str = ""
-    webpage: str = ""           # 来源页面（Bing 的 copyrightlink / Openverse 详情页）
+    webpage: str = ""           # 来源页面（如 Bing 的 copyrightlink）
     width: int = 0
     height: int = 0
     file_size: int = 0

@@ -151,13 +151,46 @@ def main() -> int:
     print("== 显示方式默认完整 ==")
     assert cfg.data.rotation.fit_mode == "适应（完整显示）", cfg.data.rotation.fit_mode
 
-    print("== 托盘通知 ==")
+    print("== 自动轮换默认自动切换 ==")
+    cfg.data.rotation.enabled = True          # 冒烟里关过定时器，这里恢复
+    cfg.data.rotation.interval_minutes = 30
+    engine.pause(False)
+    engine.apply_timer()
+    assert engine.rotation_enabled(), "默认应启用自动轮换"
+    assert engine.seconds_to_next() > 0, "启动后倒计时必须已在跑"
+    assert engine.is_paused() is False
+    print(f"  倒计时已在跑：{engine.seconds_to_next()} 秒后切换")
+
+    engine.pause(True)
+    assert engine.seconds_to_next() == -1
+    win._update_countdown()
+    print("  暂停后状态：", win.label_next.text())
+    engine.pause(False)
+    win._update_countdown()
+    print("  继续后状态：", win.label_next.text())
+    assert engine.seconds_to_next() > 0
+
+    print("== 通知策略（仅失败/严重错误才通知）==")
+    import wallpaper_changer.ui.tray as tray_mod
     from wallpaper_changer.ui.tray import TrayIcon
 
+    assert not hasattr(TrayIcon, "notify"), "不应再有换图成功通知入口"
+    assert hasattr(TrayIcon, "error")
+    win._on_changed(saved)      # 换图成功：不得弹通知
+    print("  换图成功：静默 ✅")
+
+    print("== 托盘 ==")
     ctx.tray = TrayIcon(ctx)
-    ctx.tray.info("冒烟测试通知", 500)
+    ctx.tray.error("冒烟：模拟失败通知", 100)
     win.hide_to_tray()          # 这里曾因 tray.Information 抛 AttributeError
-    print("  托盘创建 + info() + 隐藏到托盘 均正常")
+    print("  托盘创建 + error() + 隐藏到托盘 均正常")
+
+    print("== 启动回显当前壁纸 ==")
+    restored = engine.restore_current()
+    assert restored is not None, "有历史时应能回显上一次壁纸"
+    assert win.label_title.text() == restored.display_title
+    assert win.preview.pixmap() is not None or not restored.local_path
+    print(f"  首页已显示当前壁纸：{win.label_title.text()}")
 
     print("== 图标 ==")
     assert not app_icon().isNull()

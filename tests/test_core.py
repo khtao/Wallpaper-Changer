@@ -263,30 +263,22 @@ def test_config_broken_json_falls_back(tmp_path):
     assert p.with_suffix(".json.broken").exists()   # 原文件已备份
 
 
-def test_database_delete_by_source(tmp_path):
-    db = Database(tmp_path / "t4.db")
-    a = db.upsert(ImageRecord(source="openverse", source_id="o1"))
-    b = db.upsert(ImageRecord(source="bing", source_id="b1"))
-    db.mark_used(a.id)
-    db.mark_used(b.id)
-    assert db.count_by_source("openverse") == 1
-    assert db.delete_by_source("openverse") == 1
-    assert db.count_by_source("openverse") == 0
-    assert db.get(b.id) is not None          # 其他来源不受影响
-    assert len(db.list_history(limit=20)) == 1  # 关联历史一并清理
-    db.close()
+def test_sources_only_bing_local_custom():
+    """来源仅剩 Bing / 本地 / 自定义链接，且不再有任何清理旧来源的入口。"""
+    import wallpaper_changer.database as db_mod
+    import wallpaper_changer.sources as src_mod
 
-
-def test_openverse_source_removed():
-    """Openverse 来源已移除：配置无该字段，来源列表也不再包含它。"""
     from wallpaper_changer.sources import REGISTRY, SOURCE_LABELS, build_sources
 
     cfg = config_mod.Config()
     assert not hasattr(cfg.data, "openverse")
-    assert "openverse" not in REGISTRY
+    assert set(REGISTRY) == {"bing", "local", "custom_urls"}
+    assert set(SOURCE_LABELS) == {"bing", "local", "custom_urls"}
     names = [s.name for s in build_sources(cfg)]
     assert "openverse" not in names
-    assert SOURCE_LABELS.get("openverse")     # 旧记录仍要有来源名可显示
+    # 数据库与界面都不应再保留「按来源批量删除」的能力
+    assert not hasattr(db_mod.Database, "delete_by_source")
+    assert not hasattr(db_mod.Database, "count_by_source")
 
 
 def test_config_ignores_legacy_openverse_field(tmp_path):
@@ -361,9 +353,154 @@ def test_tray_notification_helpers_exist():
 
     from wallpaper_changer.ui.tray import TrayIcon
 
-    assert hasattr(TrayIcon, "info") and hasattr(TrayIcon, "warn")
+    assert hasattr(TrayIcon, "error") and hasattr(TrayIcon, "info")
     # 枚举必须按类访问
-    assert QSystemTrayIcon.MessageIcon.Information is not None
+    assert QSystemTrayIcon.MessageIcon.Critical is not None
     # 源码里不允许再出现「实例.Information」这种写法
     src = inspect.getsource(TrayIcon)
-    assert ".MessageIcon.Information" in src
+    assert ".MessageIcon." in src
+    # 已按需求收敛：不再有「换图成功通知」入口
+    assert not hasattr(TrayIcon, "notify")
+
+
+def test_rotation_starts_automatically_by_default(tmp_path):
+    """开机启动后倒计时必须自动运行（默认动作是自动切换，不是暂停）。"""
+    from PySide6.QtWidgets import QApplication
+
+    from wallpaper_changer.engine import Engine
+
+    app = QApplication.instance() or QApplication([])
+
+    cfg = config_mod.Config(tmp_path / "cfg.json")
+    db = Database(tmp_path / "h.db")
+    eng = Engine(cfg, db)
+
+    assert eng.rotation_enabled() is True
+    eng.pause(False)
+    eng.apply_timer()
+    assert eng._timer.isActive(), "默认应自动开始倒计时"
+    assert eng.seconds_to_next() > 0
+    assert eng.is_paused() is False
+
+    eng.pause(True)
+    assert eng.seconds_to_next() == -1 and eng.is_paused() is True
+    eng.pause(False)
+    assert eng.seconds_to_next() > 0
+    eng.shutdown()
+    db.close()
+
+
+def test_pause_does_not_write_enabled_to_config(tmp_path):
+    """暂停只改运行时状态，不得把 rotation.enabled 改写并落盘。
+
+    旧行为会把「暂停一次」持久化成长期关闭，导致之后每次开机都停在暂停。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from wallpaper_changer.engine import Engine
+
+    app = QApplication.instance() or QApplication([])
+
+    path = tmp_path / "cfg.json"
+    cfg = config_mod.Config(path)
+    db = Database(tmp_path / "h.db")
+    eng = Engine(cfg, db)
+
+    eng.pause(True)
+    cfg.save()
+    assert config_mod.Config(path).data.rotation.enabled is True, \
+        "暂停不得把配置里的启用状态改成 False"
+    eng.shutdown()
+    db.close()
+
+
+def test_startup_restores_last_wallpaper(tmp_path):
+    """启动时应把上一次成功设置的壁纸回显到首页，而不是「未设置壁纸」。"""
+    from PySide6.QtWidgets import QApplication
+
+    from wallpaper_changer.engine import Engine
+
+    app = QApplication.instance() or QApplication([])
+
+    cfg = config_mod.Config(tmp_path / "cfg.json")
+    cfg.data.rotation.enabled = False
+    db = Database(tmp_path / "h.db")
+
+    # 无历史时应返回 None
+    eng = Engine(cfg, db)
+    assert eng.restore_current() is None
+    assert eng.current is None
+
+    # 写入一条成功历史后再恢复
+    rec = db.upsert(ImageRecord(source="local", source_id="x", title="旧壁纸",
+                                local_path="/tmp/x.jpg"))
+    db.mark_used(rec.id, True, "ok")
+    got = eng.restore_current()
+    assert got is not None and got.id == rec.id
+    assert eng.current is not None and eng.current.display_title == "旧壁纸"
+    eng.shutdown()
+    db.close()
+
+
+def test_timer_restarts_after_change(tmp_path):
+    """自动切换启用时，换图成功后倒计时应从头计时。"""
+    from PySide6.QtWidgets import QApplication
+
+    from wallpaper_changer.engine import Engine
+
+    app = QApplication.instance() or QApplication([])
+
+    cfg = config_mod.Config(tmp_path / "cfg.json")
+    cfg.data.rotation.enabled = True
+    cfg.data.rotation.interval_minutes = 30
+    db = Database(tmp_path / "h.db")
+    eng = Engine(cfg, db)
+
+    eng.pause(False)
+    eng.apply_timer()
+    assert eng.seconds_to_next() > 0
+    eng._timer.setInterval(1000)          # 缩短以便观察重置
+    before = eng.seconds_to_next()
+    eng._timer.start()
+    assert eng.seconds_to_next() >= before - 1
+    eng.restart_timer()
+    assert eng._timer.isActive()
+    eng.shutdown()
+    db.close()
+
+
+def test_changing_enabled_checkbox_starts_timer_immediately(tmp_path):
+    """「启用自动轮换」勾选/取消应立即启停倒计时（不必等保存）。"""
+    from PySide6.QtWidgets import QApplication
+
+    from wallpaper_changer.engine import Engine
+    from wallpaper_changer.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+
+    cfg = config_mod.Config(tmp_path / "cfg.json")
+    cfg.data.rotation.enabled = True
+    cfg.data.rotation.interval_minutes = 30
+    db = Database(tmp_path / "h.db")
+    eng = Engine(cfg, db)
+
+    class Ctx:
+        pass
+
+    c = Ctx()
+    c.config, c.db, c.engine, c.tray, c.window = cfg, db, eng, None, None
+    win = MainWindow(c)
+    win._load_settings()
+
+    win.chk_enabled.setChecked(False)
+    assert eng.seconds_to_next() == -1
+    win._update_countdown()
+    assert win.label_next.text() == "未启用自动轮换"
+
+    win.chk_enabled.setChecked(True)
+    assert eng.seconds_to_next() > 0
+    win._update_countdown()
+    assert win.label_next.text() != "未启用自动轮换"
+
+    eng.shutdown()
+    db.close()

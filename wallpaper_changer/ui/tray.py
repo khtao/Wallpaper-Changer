@@ -2,13 +2,9 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
-from PySide6.QtCore import QObject
-from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-from ..models import ImageRecord
 from .icons import app_icon
 
 LOG = logging.getLogger(__name__)
@@ -45,7 +41,9 @@ class TrayIcon(QSystemTrayIcon):
 
         self.act_pause = menu.addAction("暂停自动轮换")
         self.act_pause.setCheckable(True)
-        self.act_pause.setChecked(not self.ctx.config.data.rotation.enabled)
+        # 暂停是运行时状态：每次启动都回到「自动切换」，
+        # 不再读取/改写配置里的 rotation.enabled
+        self.act_pause.setChecked(False)
         self.act_pause.triggered.connect(self._toggle_pause)
         self.act_fav_only = menu.addAction("仅轮换收藏")
         self.act_fav_only.setCheckable(True)
@@ -57,28 +55,35 @@ class TrayIcon(QSystemTrayIcon):
         self.setContextMenu(menu)
 
     def _toggle_pause(self, checked: bool) -> None:
+        """暂停 / 继续倒计时。
+
+        只改运行时状态，不落盘：否则「暂停过一次」会被写成配置里的
+        永久关闭，导致之后每次开机都停在暂停状态。
+        要长期关闭请用界面上的「启用自动轮换」。
+        """
         self.ctx.engine.pause(checked)
-        self.ctx.config.data.rotation.enabled = not checked
-        self.ctx.config.save()
-        if not checked:
-            self.ctx.engine.apply_timer()
+        # 静默处理：菜单项本身的勾选状态就是反馈，不再弹桌面通知
 
     def _toggle_fav_only(self, checked: bool) -> None:
         self.ctx.engine.set_favorite_only(checked)
-        self.info("已切换为仅轮换收藏" if checked else "恢复全部图片轮换", 2000)
 
     # ---------- 通知 ----------
+    # 通知策略：仅在「切换失败 / 严重错误」时打扰用户。
+    # 换图成功、收藏、暂停等日常操作一律静默（状态栏与日志可见）。
+    def error(self, text: str, timeout: int = 6000) -> None:
+        """严重错误 / 切换失败通知。"""
+        body = (text[:180] + "…") if len(text) > 180 else text
+        self.showMessage("Wallpaper Changer · 出错了", body,
+                         QSystemTrayIcon.MessageIcon.Critical, timeout)
+
     def info(self, body: str, timeout: int = 2500, title: str = "Wallpaper Changer") -> None:
-        """统一的普通通知。
+        """保留给「必须让用户知道」的场景（如依赖缺失）。
 
         注意：PySide6 里消息图标枚举必须按类访问
         （``QSystemTrayIcon.MessageIcon.Information``），
         不能写成 ``实例.Information``，否则会抛 AttributeError。
         """
         self.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, timeout)
-
-    def warn(self, body: str, timeout: int = 3000, title: str = "Wallpaper Changer") -> None:
-        self.showMessage(title, body, QSystemTrayIcon.MessageIcon.Warning, timeout)
 
     # ---------- 行为 ----------
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
@@ -91,13 +96,3 @@ class TrayIcon(QSystemTrayIcon):
             win.show()
             win.raise_()
             win.activateWindow()
-
-    def notify(self, rec: ImageRecord) -> None:
-        title = rec.display_title[:60] or "新壁纸"
-        body = f"{rec.source}" + (f" · {rec.author}" if rec.author else "")
-        if rec.local_path and Path(rec.local_path).exists():
-            pix = QPixmap(rec.local_path).scaledToWidth(320)
-            self.showMessage("已更换壁纸", f"{title}\n{body}", QIcon(pix), 4000)
-        else:
-            self.showMessage("已更换壁纸", f"{title}\n{body}",
-                             QSystemTrayIcon.MessageIcon.Information, 4000)

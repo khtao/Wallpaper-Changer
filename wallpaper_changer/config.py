@@ -121,6 +121,7 @@ class AppSettings:
     autostart: bool = False
     start_minimized: bool = True
     close_to_tray: bool = True
+    # 仅在「切换失败 / 严重错误」时弹桌面通知；成功换图、收藏等一律静默
     show_notifications: bool = True
     proxy: str = ""       # 如 http://127.0.0.1:7890
     log_level: str = "INFO"

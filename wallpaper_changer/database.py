@@ -192,23 +192,6 @@ class Database:
         self.conn.commit()
         return bool(cur.rowcount)
 
-    def delete_by_source(self, source: str) -> int:
-        """删除某个来源的全部图片与相关历史，返回删除条数。"""
-        cur = self.conn.execute("SELECT id FROM images WHERE source=?", (source,))
-        ids = [r["id"] for r in cur.fetchall()]
-        if not ids:
-            return 0
-        marks = ",".join("?" * len(ids))
-        self.conn.execute(f"DELETE FROM history WHERE image_id IN ({marks})", ids)
-        self.conn.execute("DELETE FROM images WHERE source=?", (source,))
-        self.conn.commit()
-        return len(ids)
-
-    def count_by_source(self, source: str) -> int:
-        return self.conn.execute(
-            "SELECT COUNT(*) FROM images WHERE source=?", (source,)
-        ).fetchone()[0]
-
     def delete_image(self, image_id: int) -> bool:
         cur = self.conn.execute("DELETE FROM images WHERE id=?", (image_id,))
         self.conn.execute("DELETE FROM history WHERE image_id=?", (image_id,))
@@ -246,6 +229,22 @@ class Database:
             (limit,),
         )
         return [self._row_to_record(r) for r in cur.fetchall()]
+
+    def last_applied_record(self) -> ImageRecord | None:
+        """最近一次**成功**设置过的壁纸，用于启动时回显当前壁纸。
+
+        优先取有 local_path 且文件仍在的记录；找不到就返回 None。
+        """
+        cur = self.conn.execute(
+            "SELECT image_id, local_path FROM history "
+            "WHERE success=1 ORDER BY id DESC LIMIT 20"
+        )
+        for row in cur.fetchall():
+            image_id = row["image_id"]
+            rec = self.get(image_id) if image_id else None
+            if rec is not None:
+                return rec
+        return None
 
     def list_history(self, limit: int = 200) -> List[sqlite3.Row]:
         cur = self.conn.execute(
