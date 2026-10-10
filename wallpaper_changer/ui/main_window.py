@@ -5,11 +5,13 @@ import logging
 from pathlib import Path
 from typing import List
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtWidgets import QApplication  # noqa: F401  （发现分类时刷新界面）
 from PySide6.QtGui import QAction, QCloseEvent, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPlainTextEdit,
     QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget, QDoubleSpinBox,
 )
 
@@ -17,9 +19,31 @@ from ..config import Config, IS_WINDOWS, fit_modes_for_platform
 from ..database import Database
 from ..models import ImageRecord
 from ..wallpaper import detect_desktop, screen_info
+from ..sources.bzee import (
+    DESKTOP_CATEGORIES, MOBILE_CATEGORIES, POPULAR_KEYWORDS, BzeeSource,
+)
 from .gallery import GalleryView
 
 LOG = logging.getLogger(__name__)
+
+
+class _PreviewLoader(QThread):
+    """后台下载首页预览图（缓存缺失时补载）。"""
+
+    done = Signal(str)      # 本地路径，失败则为空串
+
+    def __init__(self, fetcher, rec: ImageRecord):
+        super().__init__()
+        self.fetcher = fetcher
+        self.rec = rec
+
+    def run(self) -> None:  # pragma: no cover - 线程环境
+        try:
+            path = self.fetcher.ensure_local(self.rec)
+            self.done.emit(path)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("预览图下载失败：%s", exc)
+            self.done.emit("")
 
 
 class MainWindow(QMainWindow):
@@ -241,6 +265,66 @@ class MainWindow(QMainWindow):
         f.addRow("分辨率：", self.combo_bing_res)
         lay.addWidget(gb)
 
+        # Bzee 图库
+        gbz = QGroupBox("Bzee 图库（photo.bzee.cn · 4K 高清）")
+        gbz.setCheckable(True)
+        self.gb_bzee = gbz
+        vbz = QVBoxLayout(gbz)
+
+        row_lib = QHBoxLayout()
+        self.combo_bzee_lib = QComboBox()
+        self.combo_bzee_lib.addItem("桌面图库", "desktop")
+        self.combo_bzee_lib.addItem("手机图库", "mobile")
+        self.combo_bzee_lib.setToolTip("切换图库会重新载入该库下的分类")
+        self.combo_bzee_lib.currentIndexChanged.connect(self._bzee_lib_changed)
+        self.btn_bzee_all = QPushButton("全选")
+        self.btn_bzee_none = QPushButton("清空")
+        self.btn_bzee_all.clicked.connect(lambda: self._bzee_select(True))
+        self.btn_bzee_none.clicked.connect(lambda: self._bzee_select(False))
+        row_lib.addWidget(QLabel("图库："))
+        row_lib.addWidget(self.combo_bzee_lib)
+        row_lib.addStretch(1)
+        row_lib.addWidget(self.btn_bzee_all)
+        row_lib.addWidget(self.btn_bzee_none)
+        vbz.addLayout(row_lib)
+
+        row_disc = QHBoxLayout()
+        self.btn_bzee_disc = QPushButton("在线刷新分类")
+        self.btn_bzee_disc.setToolTip(
+            "联网抓取 photo.bzee.cn，用站点上真实的分类链接替换内置列表。"
+            "若你的网络访问该站返回 403，请保持内置列表或手动勾选。")
+        self.btn_bzee_disc.clicked.connect(self._bzee_discover)
+        self.label_bzee_disc = QLabel("")
+        self.label_bzee_disc.setStyleSheet("color:#8a8f98;")
+        row_disc.addWidget(self.btn_bzee_disc)
+        row_disc.addWidget(self.label_bzee_disc, 1)
+        vbz.addLayout(row_disc)
+
+        self.list_bzee_cat = QListWidget()
+        self.list_bzee_cat.setSelectionMode(QListWidget.MultiSelection)
+        self.list_bzee_cat.setToolTip(
+            "不选 = 抓该图库首页（各分类混合的最新图）；\n"
+            "勾选后只抓这些分类。Ctrl/Shift 可多选。")
+        vbz.addWidget(self.list_bzee_cat, 1)
+
+        self.edit_bzee_kw = QLineEdit()
+        self.edit_bzee_kw.setPlaceholderText(
+            "关键词，逗号分隔，留空不过滤。例：风景,星空,游戏")
+        self.edit_bzee_kw.setToolTip("只对图片标题做包含匹配；站点热门词："
+                                     + "、".join(POPULAR_KEYWORDS))
+        self.spin_bzee_pages = QSpinBox()
+        self.spin_bzee_pages.setRange(1, 5)
+        self.spin_bzee_pages.setSuffix(" 页/分类")
+        self.combo_bzee_size = QComboBox()
+        self.combo_bzee_size.addItem("原图（推荐，失败自动用缩略图）", "origin")
+        self.combo_bzee_size.addItem("缩略图（加载快、画质低）", "thumb")
+        fbz = QFormLayout()
+        fbz.addRow("关键词：", self.edit_bzee_kw)
+        fbz.addRow("抓取页数：", self.spin_bzee_pages)
+        fbz.addRow("图片尺寸：", self.combo_bzee_size)
+        vbz.addLayout(fbz)
+        lay.addWidget(gbz)
+
         # 本地
         gb3 = QGroupBox("本地文件夹")
         gb3.setCheckable(True)
@@ -335,9 +419,15 @@ class MainWindow(QMainWindow):
         v3 = QHBoxLayout(g3)
         self.btn_clear_history = QPushButton("清空历史记录")
         self.btn_clear_history.clicked.connect(self._clear_history)
+        self.btn_purge_bad = QPushButton("清理无效缓存")
+        self.btn_purge_bad.setToolTip(
+            "删除缓存目录里无法解码的文件（如站点返回的错误页）。\n"
+            "若预览显示「无法解码」，点这里可一次性清干净。")
+        self.btn_purge_bad.clicked.connect(self._purge_bad_cache)
         self.btn_reset = QPushButton("恢复默认设置")
         self.btn_reset.clicked.connect(self._reset_settings)
         v3.addWidget(self.btn_clear_history)
+        v3.addWidget(self.btn_purge_bad)
         v3.addWidget(self.btn_reset)
         v3.addStretch(1)
         lay.addWidget(g3)
@@ -420,6 +510,25 @@ class MainWindow(QMainWindow):
         self._set_combo(self.combo_market, d.bing.market)
         self._set_int(self.spin_bing_count, d.bing.count, 8)
         self._set_combo(self.combo_bing_res, d.bing.resolution)
+
+        bz = getattr(d, "bzee", None)
+        if bz is not None:
+            self._set_checked(self.gb_bzee, bz.enabled, False)
+            idx = self.combo_bzee_lib.findData(bz.library or "desktop")
+            # 切图库会重建列表，先阻塞信号避免重复触发
+            self.combo_bzee_lib.blockSignals(True)
+            self.combo_bzee_lib.setCurrentIndex(max(0, idx))
+            self.combo_bzee_lib.blockSignals(False)
+            self._bzee_lib_changed()
+            wanted = set(bz.categories or [])
+            for i in range(self.list_bzee_cat.count()):
+                it = self.list_bzee_cat.item(i)
+                it.setSelected(it.data(Qt.UserRole) in wanted)
+            self._set_text(self.edit_bzee_kw, ",".join(bz.keywords or []))
+            self._set_int(self.spin_bzee_pages, bz.max_pages, 1)
+            sidx = self.combo_bzee_size.findData(bz.image_size or "origin")
+            self.combo_bzee_size.setCurrentIndex(max(0, sidx))
+
         self._set_checked(self.gb_local, d.local.enabled, False)
         self.list_dirs.clear()
         self.list_dirs.addItems([str(x) for x in (d.local.directories or [])])
@@ -458,6 +567,17 @@ class MainWindow(QMainWindow):
         d.bing.market = self.combo_market.currentText().strip() or "zh-CN"
         d.bing.count = self.spin_bing_count.value()
         d.bing.resolution = self.combo_bing_res.currentText()
+
+        bz = getattr(d, "bzee", None)
+        if bz is not None:
+            bz.enabled = self.gb_bzee.isChecked()
+            bz.library = self.combo_bzee_lib.currentData() or "desktop"
+            bz.categories = self._bzee_slugs()
+            bz.keywords = [k.strip() for k in self.edit_bzee_kw.text().split(",")
+                           if k.strip()]
+            bz.max_pages = self.spin_bzee_pages.value()
+            bz.image_size = self.combo_bzee_size.currentData() or "origin"
+
         d.local.enabled = self.gb_local.isChecked()
         d.local.directories = [
             self.list_dirs.item(i).text() for i in range(self.list_dirs.count())
@@ -612,14 +732,113 @@ class MainWindow(QMainWindow):
             meta.append("★ 已收藏")
         self.label_meta.setText(" · ".join(meta))
         self.btn_fav.setText("★ 取消收藏" if rec.is_favorite else "★ 收藏")
-        if rec.local_path and Path(rec.local_path).exists():
-            pix = QPixmap(rec.local_path)
-            if not pix.isNull():
-                self.preview.setPixmap(pix.scaled(
-                    self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._update_preview(rec)
         # 换图成功不再弹桌面通知（已按需求收敛为：仅在失败/严重错误时通知）
         if self.tabs.tabText(self.tabs.currentIndex()) == "图库":
             self.refresh_views()
+
+    def _update_preview(self, rec: ImageRecord) -> None:
+        """更新首页预览图。
+
+        关键点：**只要已经有当前壁纸，就不能再显示「尚未设置壁纸」**。
+        缓存文件可能被清理（max_cache_files）或路径变化，此时要：
+          1) 先按 remote_url 找回缓存文件；
+          2) 缓存也没有就后台重新下载一张用于预览。
+        """
+        fetcher = getattr(self.engine, "fetcher", None)
+        path = fetcher.resolve_local(rec) if fetcher else None
+        if path:
+            self._set_preview_pixmap(path)
+            return
+        # 本地没有：给出明确状态，并后台补载（无远程地址则只能占位）
+        if not rec.remote_url:
+            self.preview.setText("预览图已不在缓存中")
+            return
+        self.preview.setText("正在载入预览…")
+        self._start_preview_loader(rec)
+
+    def _set_preview_pixmap(self, path: str) -> None:
+        pix = QPixmap(path)
+        if pix.isNull():
+            # Qt 解不开时用 Pillow 兜底（对 webp 等格式兼容性更好），
+            # 转成 QImage 再显示，避免直接报「无法解码」。
+            pix = self._decode_with_pil(path)
+        if pix is None or pix.isNull():
+            self.preview.setText("预览图无法解码")
+            return
+        # QLabel 同时有 text 与 pixmap 时 pixmap 优先，这里顺手清空文本
+        self.preview.setText("")
+        self.preview.setPixmap(pix.scaled(
+            self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    @staticmethod
+    def _decode_with_pil(path: str):
+        """用 Pillow 解码图片并转成 QPixmap；失败返回 None。"""
+        try:
+            from PIL import Image
+            from PIL.ImageQt import ImageQt
+        except ImportError:  # pragma: no cover - 依赖缺失
+            return None
+        try:
+            with Image.open(path) as im:
+                im = im.convert("RGBA")
+                qim = ImageQt(im)
+                from PySide6.QtGui import QPixmap
+
+                return QPixmap.fromImage(qim)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("Pillow 解码预览失败 %s: %s", path, exc)
+            return None
+
+    def _start_preview_loader(self, rec: ImageRecord) -> None:
+        """后台下载预览图，避免界面卡住。"""
+        prev = getattr(self, "_preview_loader", None)
+        if prev is not None and prev.isRunning():
+            return          # 已有任务在跑，不重复发起
+        fetcher = getattr(self.engine, "fetcher", None)
+        if fetcher is None:
+            return
+        loader = _PreviewLoader(fetcher, rec)
+        loader.done.connect(self._on_preview_loaded)
+        self._preview_loader = loader
+        loader.start()
+
+    def _on_preview_loaded(self, path: str) -> None:
+        if path:
+            self._set_preview_pixmap(path)
+        else:
+            # 下载失败（如站点 403）：保持标题等元信息可见，不再谎报「未设置」
+            self.preview.setText("预览图暂时无法加载")
+
+    def _purge_bad_cache(self) -> None:
+        """扫描缓存目录，删除无法解码的文件（错误页、截断的文件等）。"""
+        fetcher = getattr(self.engine, "fetcher", None)
+        root = Path(fetcher.cache_dir) if fetcher else None
+        if root is None or not root.exists():
+            return
+        bad = 0
+        total = 0
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            total += 1
+            try:
+                if not fetcher.is_valid_cached(p):
+                    p.unlink()
+                    bad += 1
+            except OSError:
+                pass
+        self._update_cache_label()
+        self.label_status.setText(
+            f"已清理 {bad} 个无效缓存文件（共扫描 {total} 个）")
+        self.append_log(f"清理无效缓存：删除 {bad}/{total} 个文件")
+
+    def _clear_preview(self) -> None:
+        """确无当前壁纸时才回到初始文案。"""
+        self.preview.setPixmap(QPixmap())
+        self.preview.setText("尚未设置壁纸")
+        self.label_title.setText("—")
+        self.label_meta.setText("—")
 
     def _on_status(self, text: str) -> None:
         self.label_status.setText(text)
@@ -644,6 +863,58 @@ class MainWindow(QMainWindow):
         self.config.data.rotation.enabled = bool(checked)
         self.engine.apply_timer()
         self._update_countdown()
+
+    # ---------- Bzee ----------
+    def _bzee_lib_changed(self) -> None:
+        """切换图库时重建分类列表（保留仍存在的勾选）。"""
+        lib = self.combo_bzee_lib.currentData() or "desktop"
+        names = DESKTOP_CATEGORIES if lib == "desktop" else MOBILE_CATEGORIES
+        keep = {self.list_bzee_cat.item(i).data(Qt.UserRole)
+                for i in range(self.list_bzee_cat.count())
+                if self.list_bzee_cat.item(i).isSelected()}
+        self.list_bzee_cat.clear()
+        for slug, name in names.items():
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, slug)
+            item.setSelected(slug in keep)
+            self.list_bzee_cat.addItem(item)
+
+    def _bzee_select(self, select: bool) -> None:
+        for i in range(self.list_bzee_cat.count()):
+            self.list_bzee_cat.item(i).setSelected(select)
+
+    def _bzee_discover(self) -> None:
+        """联网抓取站点真实分类，替换内置列表（内置 slug 未经站点验证）。"""
+        self.btn_bzee_disc.setEnabled(False)
+        self.label_bzee_disc.setText("正在抓取 photo.bzee.cn …")
+        QApplication.processEvents()
+        try:
+            src = BzeeSource(self.config.data.bzee)
+            found = src.discover_categories()
+        except Exception as exc:  # noqa: BLE001
+            found = {}
+            LOG.warning("Bzee 分类发现异常：%s", exc)
+        finally:
+            self.btn_bzee_disc.setEnabled(True)
+
+        got = {k: v for k, v in (found or {}).items() if v}
+        if not got:
+            self.label_bzee_disc.setText(
+                "未取到在线分类（站点可能拒绝了该请求），继续使用内置列表")
+            return
+        # 用在线结果替换内置表，让界面与实际链接一致
+        for lib, mapping in got.items():
+            table = DESKTOP_CATEGORIES if lib == "desktop" else MOBILE_CATEGORIES
+            table.clear()
+            table.update(mapping)
+        self._bzee_lib_changed()
+        total = sum(len(v) for v in got.values())
+        self.label_bzee_disc.setText(f"已更新：共 {total} 个分类（在线）")
+
+    def _bzee_slugs(self) -> List[str]:
+        return [self.list_bzee_cat.item(i).data(Qt.UserRole)
+                for i in range(self.list_bzee_cat.count())
+                if self.list_bzee_cat.item(i).isSelected()]
 
     def _toggle_pause(self, checked: bool) -> None:
         """暂停 / 继续倒计时（运行时，不落盘）。"""

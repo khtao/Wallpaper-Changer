@@ -91,6 +91,18 @@ class LocalSettings:
 
 
 @dataclass
+class BzeeSettings:
+    """Bzee 图库（photo.bzee.cn）。"""
+
+    enabled: bool = False
+    library: str = "desktop"          # desktop=桌面图库 / mobile=手机图库
+    categories: List[str] = field(default_factory=list)   # slug 列表，空=全部
+    keywords: List[str] = field(default_factory=list)     # 标题需包含的关键词
+    max_pages: int = 1                # 每个分类抓几页
+    image_size: str = "origin"        # origin=原图（失败自动回退缩略图）/ thumb=缩略图
+
+
+@dataclass
 class CustomUrlSettings:
     enabled: bool = False
     urls: List[str] = field(default_factory=list)
@@ -113,6 +125,7 @@ class RotationSettings:
 @dataclass
 class AppSettings:
     bing: BingSettings = field(default_factory=BingSettings)
+    bzee: BzeeSettings = field(default_factory=BzeeSettings)
     local: LocalSettings = field(default_factory=LocalSettings)
     custom_urls: CustomUrlSettings = field(default_factory=CustomUrlSettings)
     rotation: RotationSettings = field(default_factory=RotationSettings)
@@ -210,6 +223,7 @@ class Config:
             raw = {}
         self.data = AppSettings(
             bing=_from_dict(BingSettings, raw.get("bing", {})),
+            bzee=_from_dict(BzeeSettings, raw.get("bzee", {})),
             local=_from_dict(LocalSettings, raw.get("local", {})),
             custom_urls=_from_dict(CustomUrlSettings, raw.get("custom_urls", {})),
             rotation=_from_dict(RotationSettings, raw.get("rotation", {})),

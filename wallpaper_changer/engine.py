@@ -27,16 +27,28 @@ class ApplyTask(QThread):
 
     result = Signal(object, bool, str)  # record, ok, message
 
-    def __init__(self, fetcher: Fetcher, record: ImageRecord, mode: str, set_dark: bool):
+    def __init__(self, fetcher: Fetcher, record: ImageRecord, mode: str, set_dark: bool,
+                 min_width: int = 0, min_height: int = 0):
         super().__init__()
         self.fetcher = fetcher
         self.record = record
         self.mode = mode
         self.set_dark = set_dark
+        self.min_width = int(min_width or 0)
+        self.min_height = int(min_height or 0)
 
     def run(self) -> None:  # pragma: no cover - 需要线程环境
         try:
             path = self.fetcher.ensure_local(self.record)
+            # 兜底拿到的是缩略图时（如 Bzee 原图不可用），分辨率往往只有几百像素，
+            # 直接设为壁纸会非常糊 —— 这里判定为失败，让引擎自动换下一张。
+            w, h = self.record.width, self.record.height
+            if self.min_width and self.min_height and w and h:
+                if w < self.min_width or h < self.min_height:
+                    self.result.emit(
+                        self.record, False,
+                        f"分辨率过低（{w}×{h}，低于 {self.min_width}×{self.min_height}）")
+                    return
             ok, msg = set_wallpaper(path, self.mode, self.set_dark)
             self.result.emit(self.record, bool(ok), str(msg))
         except Exception as exc:  # noqa: BLE001
@@ -225,7 +237,8 @@ class Engine(QObject):
         self._applying = True
         self.status.emit(f"{reason}：正在下载 {rec.display_title}")
         rot = self.config.data.rotation
-        task = ApplyTask(self.fetcher, rec, rot.fit_mode, rot.set_dark_variant)
+        task = ApplyTask(self.fetcher, rec, rot.fit_mode, rot.set_dark_variant,
+                         rot.min_width, rot.min_height)
         task.result.connect(self._on_applied)
         task.finished.connect(lambda: self._reap(task))
         self._tasks.append(task)

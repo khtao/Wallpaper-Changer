@@ -40,7 +40,17 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
 
 
 def _assets_dir() -> Path:
-    """项目 assets 目录（本文件位于 <根>/wallpaper_changer/doctor.py）。"""
+    """项目 assets 目录（本文件位于 <根>/wallpaper_changer/doctor.py）。
+
+    PyInstaller 打包后用 sys._MEIPASS 定位，避免图标找不到。
+    """
+    import sys
+
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        candidate = Path(meipass) / "assets"
+        if candidate.exists():
+            return candidate
     return Path(__file__).resolve().parent.parent / "assets"
 
 

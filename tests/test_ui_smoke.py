@@ -109,6 +109,9 @@ def main() -> int:
           "历史数:", len(engine.db.list_history(limit=10)))
 
     print("== 主窗口 ==")
+    from wallpaper_changer.sources.bzee import (
+        DESKTOP_CATEGORIES, MOBILE_CATEGORIES,
+    )
     ctx = Ctx(cfg, db, engine)
     win = MainWindow(ctx)
     ctx.window = win
@@ -151,6 +154,47 @@ def main() -> int:
     print("== 显示方式默认完整 ==")
     assert cfg.data.rotation.fit_mode == "适应（完整显示）", cfg.data.rotation.fit_mode
 
+    print("== Bzee 图库来源 ==")
+    assert hasattr(win, "gb_bzee") and hasattr(win, "list_bzee_cat")
+    assert win.list_bzee_cat.count() == len(DESKTOP_CATEGORIES)
+    win.combo_bzee_lib.setCurrentIndex(1)          # 切到手机图库
+    assert win.list_bzee_cat.count() == len(MOBILE_CATEGORIES)
+    win.combo_bzee_lib.setCurrentIndex(0)
+    win._bzee_select(True)
+    assert len(win._bzee_slugs()) == len(DESKTOP_CATEGORIES)
+    win._bzee_select(False)
+    assert win._bzee_slugs() == []
+    # 勾选自然风景 + 关键词，走一次配置读写
+    for i in range(win.list_bzee_cat.count()):
+        it = win.list_bzee_cat.item(i)
+        it.setSelected(it.data(Qt.UserRole) == "ziran")
+    win.edit_bzee_kw.setText("风景,星空")
+    win.gb_bzee.setChecked(True)
+    win._collect_settings()
+    bz = win.config.data.bzee
+    assert bz.enabled and bz.categories == ["ziran"]
+    assert bz.keywords == ["风景", "星空"] and bz.library == "desktop"
+    win._load_settings()
+    assert win.combo_bzee_lib.currentData() == "desktop"
+    assert win._bzee_slugs() == ["ziran"]
+    assert win.edit_bzee_kw.text() == "风景,星空"
+    print("  Bzee 分组：分类切换/多选/关键词 读写正常")
+
+    print("== 清理无效缓存 ==")
+    from PIL import Image as _PILImage
+
+    root = Path(engine.fetcher.cache_dir)
+    (root / "bzee").mkdir(parents=True, exist_ok=True)
+    good = root / "bzee" / "smoke-good.webp"
+    bad = root / "bzee" / "smoke-bad.webp"
+    _PILImage.new("RGB", (60, 40), (10, 20, 30)).save(good, "WEBP")
+    bad.write_bytes(b'{"error":403}')
+    assert hasattr(win, "btn_purge_bad")
+    win._purge_bad_cache()
+    assert good.exists(), "正常图片不应被删"
+    assert not bad.exists(), "无效文件应被清理"
+    print("  无效缓存已清理，正常文件保留 ✅")
+
     print("== 自动轮换默认自动切换 ==")
     cfg.data.rotation.enabled = True          # 冒烟里关过定时器，这里恢复
     cfg.data.rotation.interval_minutes = 30
@@ -184,6 +228,30 @@ def main() -> int:
     ctx.tray.error("冒烟：模拟失败通知", 100)
     win.hide_to_tray()          # 这里曾因 tray.Information 抛 AttributeError
     print("  托盘创建 + error() + 隐藏到托盘 均正常")
+
+    print("== 预览区不得谎报「尚未设置壁纸」==")
+    from PIL import Image as _PILImage
+
+    from wallpaper_changer.models import ImageRecord as _Rec
+
+    # 缓存缺失但有 remote_url：应显示「正在载入预览…」并后台补载
+    win.preview.setText("尚未设置壁纸")
+    rec_nocache = _Rec(source="bzee", source_id="nocache", title="无缓存图",
+                       local_path="", remote_url="https://x/y/nocache.webp")
+    win._update_preview(rec_nocache)
+    assert win.preview.text() != "尚未设置壁纸", win.preview.text()
+    print("  无缓存时：", win.preview.text())
+
+    # 缓存可找回：应直接出图
+    rec_cache = _Rec(source="bzee", source_id="cached", title="缓存回退图",
+                     local_path="/nonexistent/gone.jpg",
+                     remote_url="https://x/y/cached.webp")
+    cache_path = engine.fetcher.target_path(rec_cache)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _PILImage.new("RGB", (1600, 900), (20, 80, 140)).save(cache_path)
+    win._update_preview(rec_cache)
+    assert not win.preview.pixmap().isNull(), "找回缓存后应能显示预览"
+    print("  缓存回退后：已出图 ✅")
 
     print("== 启动回显当前壁纸 ==")
     restored = engine.restore_current()

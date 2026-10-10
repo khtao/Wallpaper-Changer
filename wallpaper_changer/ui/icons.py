@@ -1,6 +1,7 @@
 """PyQt/PySide 无关的小工具：图标生成与加载。"""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
@@ -10,10 +11,19 @@ from PySide6.QtCore import Qt
 def assets_dir() -> Path:
     """返回项目 assets 目录。
 
-    本文件位于 <项目根>/wallpaper_changer/ui/icons.py，
-    所以项目根是 parent(ui) -> parent(wallpaper_changer) -> parent(根)。
+    三种运行环境都要能找到图标：
+      1) 源码运行：<项目根>/wallpaper_changer/ui/icons.py -> 上三级
+      2) PyInstaller 打包（onedir）：模块在 _internal/wallpaper_changer/ui/，
+         assets 也被打进 _internal/assets，同样是上三级
+      3) 优先用 sys._MEIPASS（onefile 解压目录），最稳
+
     早期版本少了一级，导致 deb 安装后（尤其从 /opt 运行时）找不到图标。
     """
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        candidate = Path(meipass) / "assets"
+        if candidate.exists():
+            return candidate
     return Path(__file__).resolve().parent.parent.parent / "assets"
 
 

@@ -7,6 +7,7 @@ import os
 import shutil
 import time
 from pathlib import Path
+from typing import Optional
 
 import requests
 
@@ -22,12 +23,15 @@ class Fetcher:
     """把图片落到本地缓存目录，供设置壁纸使用。"""
 
     def __init__(self, cache_dir: Path, proxy: str = "", timeout: int = 20,
-                 max_files: int = 300):
+                 max_files: int = 300, retries: int = 3, retry_delay: float = 0.8):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.proxy = proxy
         self.timeout = timeout
         self.max_files = max_files
+        # 网络偶发失败很常见（尤其对 Bzee 这类有 WAF 的站点），默认重试 3 次
+        self.retries = max(1, int(retries))
+        self.retry_delay = float(retry_delay)
 
     # ---------- 路径 ----------
     def target_path(self, rec: ImageRecord) -> Path:
@@ -59,31 +63,165 @@ class Fetcher:
 
         target = self.target_path(rec)
         if target.exists() and target.stat().st_size > 0 and not force:
-            self._fill_size(rec, target)
-            rec.local_path = str(target)
-            return str(target)
+            # 命中缓存也校验一次：损坏文件（如历史遗留的错误页）不应被直接使用
+            if self.is_valid_cached(target):
+                self._fill_size(rec, target)
+                rec.local_path = str(target)
+                return str(target)
+            try:
+                target.unlink()
+            except OSError:
+                pass
 
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(target.suffix + ".part")
         proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
-        headers = {"User-Agent": USER_AGENT, "Referer": rec.webpage or ""}
-        with requests.get(
-            rec.remote_url, stream=True, timeout=self.timeout,
-            headers=headers, proxies=proxies,
-        ) as resp:
-            resp.raise_for_status()
-            ctype = resp.headers.get("Content-Type", "")
-            if ctype.startswith("text/") and "json" in ctype:
-                raise ValueError(f"返回的不是图片（{ctype}）")
-            with open(tmp, "wb") as fh:
-                for chunk in resp.iter_content(CHUNK):
-                    if chunk:
-                        fh.write(chunk)
-        os.replace(tmp, target)
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Referer": rec.webpage or self._referer_for(rec),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+
+        # 依次尝试：主地址 -> 备用地址（如 Bzee 原图不可用时的缩略图）
+        candidates = [rec.remote_url]
+        if rec.fallback_url and rec.fallback_url != rec.remote_url:
+            candidates.append(rec.fallback_url)
+        last_err: Optional[Exception] = None
+        for url in candidates:
+            ok = False
+            for attempt in range(1, self.retries + 1):
+                try:
+                    with requests.get(
+                        url, stream=True, timeout=self.timeout,
+                        headers=headers, proxies=proxies,
+                    ) as resp:
+                        resp.raise_for_status()
+                        ctype = resp.headers.get("Content-Type", "")
+                        if ctype.startswith("text/") and "json" in ctype:
+                            raise ValueError(f"返回的不是图片（{ctype}）")
+                        with open(tmp, "wb") as fh:
+                            for chunk in resp.iter_content(CHUNK):
+                                if chunk:
+                                    fh.write(chunk)
+                    # 空文件视为失败（站点偶发返回 200 但无内容）
+                    if os.path.getsize(tmp) == 0:
+                        raise ValueError("下载到空文件")
+                    # 站点有时返回 200 但内容是错误页（JSON/HTML），
+                    # 直接存盘会让预览显示「无法解码」，必须在这一步拦掉。
+                    self._verify_image(tmp)
+                    if url != rec.remote_url:
+                        LOG.info("主地址不可用，已改用备用地址：%s", url)
+                    os.replace(tmp, target)
+                    ok = True
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    LOG.debug("下载失败（第 %d/%d 次）%s: %s",
+                              attempt, self.retries, url, exc)
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+                    if attempt < self.retries:
+                        time.sleep(self.retry_delay * attempt)   # 简单退避
+            if ok:
+                break
+        else:
+            raise RuntimeError(f"下载失败：{last_err}")
         self._fill_size(rec, target)
         rec.local_path = str(target)
         self.prune()
         return str(target)
+
+    @staticmethod
+    def _verify_image(path) -> None:
+        """确认下载到的确实是图片，否则抛错（让上层重试/换源）。
+
+        用 PIL 而不是只看扩展名或 Content-Type：站点被 WAF 拦时常常
+        返回 200 + JSON 错误页，那样存下来的文件 Qt 解不开。
+        """
+        try:
+            from PIL import Image
+        except ImportError:      # 没装 Pillow 就只做最小检查
+            with open(path, "rb") as fh:
+                head = fh.read(16)
+            if not head:
+                raise ValueError("文件为空")
+            return
+        try:
+            with Image.open(path) as im:
+                im.verify()
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"下载内容不是有效图片：{exc}") from exc
+
+    def is_valid_cached(self, path) -> bool:
+        """缓存文件是否仍是能被解码的图片（用于预览前自检）。"""
+        p = Path(path)
+        if not p.exists() or p.stat().st_size == 0:
+            return False
+        try:
+            self._verify_image(p)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _referer_for(rec: ImageRecord) -> str:
+        """按来源给一个合适的 Referer，降低被站点拒绝的概率。"""
+        if rec.source == "bzee":
+            return "https://photo.bzee.cn/"
+        if rec.source == "bing":
+            return "https://www.bing.com/"
+        return ""
+
+    def cached_path(self, rec: ImageRecord) -> Optional[Path]:
+        """按 remote_url 计算缓存路径；文件确实存在且能解码才返回。"""
+        if not rec.remote_url:
+            return None
+        p = self.target_path(rec)
+        if not p.exists() or p.stat().st_size == 0:
+            return None
+        if not self.is_valid_cached(p):
+            # 损坏的缓存（如当年存下的错误页）直接清掉，避免一直显示无法解码
+            try:
+                p.unlink()
+                LOG.info("已删除损坏的缓存文件：%s", p)
+            except OSError:
+                pass
+            return None
+        return p
+
+    def resolve_local(self, rec: ImageRecord) -> Optional[str]:
+        """在不联网的前提下，尽力找出本机可用的图片文件。
+
+        顺序：已记录的 local_path -> 主地址缓存 -> 备用地址缓存。
+        用于预览等场景，避免缓存文件被清理后界面显示不出来。
+        """
+        if rec.local_path and os.path.isfile(rec.local_path):
+            if self.is_valid_cached(rec.local_path):
+                return rec.local_path
+            # local_path 指向的文件已损坏，清掉后继续找缓存
+            try:
+                os.remove(rec.local_path)
+            except OSError:
+                pass
+        p = self.cached_path(rec)
+        if p:
+            rec.local_path = str(p)
+            return str(p)
+        if rec.fallback_url:
+            saved = rec.remote_url
+            rec.remote_url = rec.fallback_url
+            try:
+                p2 = self.cached_path(rec)
+            finally:
+                rec.remote_url = saved
+            if p2:
+                rec.local_path = str(p2)
+                return str(p2)
+        return None
 
     def _fill_size(self, rec: ImageRecord, path: Path) -> None:
         try:

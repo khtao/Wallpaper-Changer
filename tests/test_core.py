@@ -263,20 +263,26 @@ def test_config_broken_json_falls_back(tmp_path):
     assert p.with_suffix(".json.broken").exists()   # 原文件已备份
 
 
-def test_sources_only_bing_local_custom():
-    """来源仅剩 Bing / 本地 / 自定义链接，且不再有任何清理旧来源的入口。"""
+def test_sources_registry_contents():
+    """来源为 Bing / Bzee / 本地 / 自定义链接，且无清理旧来源的入口。"""
     import wallpaper_changer.database as db_mod
-    import wallpaper_changer.sources as src_mod
 
     from wallpaper_changer.sources import REGISTRY, SOURCE_LABELS, build_sources
 
     cfg = config_mod.Config()
     assert not hasattr(cfg.data, "openverse")
-    assert set(REGISTRY) == {"bing", "local", "custom_urls"}
-    assert set(SOURCE_LABELS) == {"bing", "local", "custom_urls"}
+    assert set(REGISTRY) == {"bing", "bzee", "local", "custom_urls"}
+    assert set(SOURCE_LABELS) == {"bing", "bzee", "local", "custom_urls"}
+    # bzee 默认关闭，开启后才应出现在构建结果里
     names = [s.name for s in build_sources(cfg)]
     assert "openverse" not in names
-    # 数据库与界面都不应再保留「按来源批量删除」的能力
+    assert "bzee" not in names
+    cfg.data.bzee.enabled = True
+    assert "bzee" in [s.name for s in build_sources(cfg)]
+    # 关掉 Bing 后应消失，验证开关确实生效
+    cfg.data.bing.enabled = False
+    assert "bing" not in [s.name for s in build_sources(cfg)]
+    # 数据库不应再保留「按来源批量删除」的能力
     assert not hasattr(db_mod.Database, "delete_by_source")
     assert not hasattr(db_mod.Database, "count_by_source")
 
@@ -502,5 +508,217 @@ def test_changing_enabled_checkbox_starts_timer_immediately(tmp_path):
     win._update_countdown()
     assert win.label_next.text() != "未启用自动轮换"
 
+    eng.shutdown()
+    db.close()
+
+
+def test_preview_falls_back_to_cache_and_never_lies(tmp_path):
+    """缓存文件被清理时，预览不得停在「尚未设置壁纸」。
+
+    场景：history 里记的 local_path 已不存在，但缓存里仍有同 URL 的文件。
+    """
+    from PIL import Image
+
+    from wallpaper_changer.engine import Engine
+
+    cfg = config_mod.Config(tmp_path / "cfg.json")
+    db = Database(tmp_path / "h.db")
+    eng = Engine(cfg, db)
+
+    remote = "https://imgtu.bzee.cn/photo/pic/renxiang/yanzhi/13930ZMBZ.webp"
+    rec = db.upsert(ImageRecord(source="bzee", source_id="x1", title="缓存回退",
+                                local_path=str(tmp_path / "gone.jpg"),
+                                remote_url=remote, width=3840, height=2561))
+    cache = eng.fetcher.target_path(rec)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (80, 40), (20, 80, 140)).save(cache)
+    db.mark_used(rec.id, True, "ok", "bzee", "缓存回退", str(tmp_path / "gone.jpg"))
+
+    # 1) 能按 remote_url 找回缓存
+    assert eng.fetcher.resolve_local(rec) == str(cache)
+
+    # 2) 完全没缓存时，只返回 None，由界面显示「正在载入」而非「尚未设置」
+    rec2 = db.upsert(ImageRecord(source="bzee", source_id="x2", title="无缓存",
+                                 local_path="", remote_url="https://x/y/2.webp"))
+    assert eng.fetcher.resolve_local(rec2) is None
+    eng.shutdown()
+    db.close()
+
+
+def test_download_retries_then_falls_back(tmp_path):
+    """主地址重试 N 次仍失败后，应回退到备用地址。"""
+    import wallpaper_changer.fetcher as fetcher_mod
+    from wallpaper_changer.models import ImageRecord as _IR  # noqa: F401
+
+    calls: list = []
+
+    # 用真实 webp 字节，否则会被下载后的「图片有效性校验」拦掉
+    from PIL import Image as _Img
+
+    import io as _io
+
+    buf = _io.BytesIO()
+    _Img.new("RGB", (64, 48), (200, 120, 40)).save(buf, "WEBP")
+    img_bytes = buf.getvalue()
+
+    class Resp:
+        def __init__(self, code):
+            self.status_code = code
+            self.headers = {"Content-Type": "image/webp"}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def iter_content(self, _n):
+            yield img_bytes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    def fake_get(url, **_kw):
+        calls.append(url)
+        return Resp(200 if "thumb" in url else 403)
+
+    orig_get, orig_sleep = fetcher_mod.requests.get, fetcher_mod.time.sleep
+    fetcher_mod.requests.get = fake_get
+    fetcher_mod.time.sleep = lambda _s: None
+    try:
+        f = fetcher_mod.Fetcher(tmp_path / "cache", retries=3, retry_delay=0)
+        rec = ImageRecord(source="bzee", source_id="r1",
+                          remote_url="https://imgtu.bzee.cn/photo/pic/a/b/1.webp",
+                          fallback_url="https://imgtu.bzee.cn/photo/thumb/a/b/1_400x711.webp")
+        path = f.ensure_local(rec)
+    finally:
+        fetcher_mod.requests.get = orig_get
+        fetcher_mod.time.sleep = orig_sleep
+
+    assert path and Path(path).exists()
+    origin_tries = [u for u in calls if "/photo/pic/" in u]
+    assert len(origin_tries) == 3, calls          # 原图重试到上限
+    assert calls[-1].endswith("_400x711.webp")     # 最后回退缩略图
+
+
+def test_apply_task_rejects_low_resolution(tmp_path):
+    """兜底拿到缩略图（分辨率过低）时应判定失败，而不是设成糊壁纸。"""
+    from wallpaper_changer.engine import ApplyTask
+
+    f = Fetcher.__new__(Fetcher)      # 不建目录，仅校验分支
+    rec = ImageRecord(source="bzee", source_id="low", width=400, height=711)
+
+    class FakeFetcher:
+        def ensure_local(self, _rec):
+            _rec.width, _rec.height = 400, 711
+            return "/tmp/fake.webp"
+
+    task = ApplyTask(FakeFetcher(), rec, "适应（完整显示）", False, 1280, 720)
+    got = []
+    task.result.connect(lambda r, ok, m: got.append((ok, m)))
+    task.run()
+    assert got and got[0][0] is False
+    assert "分辨率过低" in got[0][1]
+
+
+def test_corrupted_cache_is_purged_and_redownloaded(tmp_path):
+    """缓存里存的是错误页时：应被识别、删除，而不是显示「无法解码」。"""
+    from PIL import Image
+
+    from wallpaper_changer.engine import Engine
+
+    cfg = config_mod.Config(tmp_path / "cfg.json")
+    db = Database(tmp_path / "h.db")
+    eng = Engine(cfg, db)
+
+    rec = db.upsert(ImageRecord(source="bzee", source_id="bad", title="损坏缓存",
+                                remote_url="https://imgtu.bzee.cn/photo/pic/z/z/bad.webp"))
+    cache = eng.fetcher.target_path(rec)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_bytes(b'{"title":"Request denied","status":403}')   # 站点错误页
+
+    assert not eng.fetcher.is_valid_cached(cache)
+    assert eng.fetcher.resolve_local(rec) is None   # 会被清理掉而非返回坏文件
+    assert not cache.exists(), "损坏的缓存应被删除"
+
+    # 正常图片则能通过校验
+    good = tmp_path / "good.webp"
+    Image.new("RGB", (120, 80), (10, 20, 30)).save(good, "WEBP")
+    assert eng.fetcher.is_valid_cached(good)
+    eng.shutdown()
+    db.close()
+
+
+def test_download_rejects_non_image_content(tmp_path):
+    """站点返回 200 但内容是错误页时，必须判为失败而不是存成缓存。"""
+    import wallpaper_changer.fetcher as fetcher_mod
+
+    class Resp:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {"Content-Type": "application/json"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, _n):
+            yield b'{"title":"Request denied","status":403}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    orig = fetcher_mod.requests.get
+    fetcher_mod.requests.get = lambda *a, **k: Resp()
+    fetcher_mod.time.sleep = lambda _s: None
+    try:
+        f = fetcher_mod.Fetcher(tmp_path / "cache", retries=2, retry_delay=0)
+        rec = ImageRecord(source="bzee", source_id="nope",
+                          remote_url="https://imgtu.bzee.cn/photo/pic/z/z/nope.webp")
+        try:
+            f.ensure_local(rec)
+            raised = False
+        except Exception:
+            raised = True
+        assert raised, "非图片内容必须判为下载失败"
+        # 且不能留下坏缓存
+        assert not f.target_path(rec).exists()
+    finally:
+        fetcher_mod.requests.get = orig
+
+
+def test_purge_bad_cache_keeps_valid_files(tmp_path):
+    """清理无效缓存：坏文件删掉、正常图片保留。"""
+    from PIL import Image
+
+    from wallpaper_changer.engine import Engine
+
+    cfg = config_mod.Config(tmp_path / "cfg.json")
+    cfg.data.cache_dir = str(tmp_path / "cache")     # 隔离，避免动到真实缓存
+    db = Database(tmp_path / "h.db")
+    eng = Engine(cfg, db)
+    root = Path(eng.fetcher.cache_dir)
+
+    (root / "bzee").mkdir(parents=True, exist_ok=True)
+    (root / "bing").mkdir(parents=True, exist_ok=True)
+    for i in range(3):
+        Image.new("RGB", (40, 30), (i * 80, 10, 10)).save(root / "bzee" / f"g{i}.webp", "WEBP")
+    Image.new("RGB", (40, 30), (0, 90, 90)).save(root / "bing" / "g0.jpg")
+    (root / "bzee" / "bad1.webp").write_bytes(b'{"error":403}')
+    (root / "bing" / "bad2.jpg").write_bytes(b"<html>403</html>")
+
+    before = len([p for p in root.rglob("*") if p.is_file()])
+    removed = 0
+    for p in root.rglob("*"):
+        if p.is_file() and not eng.fetcher.is_valid_cached(p):
+            p.unlink()
+            removed += 1
+    after = len([p for p in root.rglob("*") if p.is_file()])
+    assert before == 6 and removed == 2 and after == 4
+    assert (root / "bzee" / "g0.webp").exists()
+    assert not (root / "bzee" / "bad1.webp").exists()
     eng.shutdown()
     db.close()

@@ -32,6 +32,14 @@ class Source:
 
     # ---------- 工具 ----------
     def session(self) -> requests.Session:
+        """返回请求会话。
+
+        若外部设置了 ``source._session``（测试用假会话），直接复用，
+        便于在不联网的情况下验证解析逻辑。
+        """
+        injected = getattr(self, "_session", None)
+        if injected is not None:
+            return injected
         s = requests.Session()
         s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
         if self.config and getattr(self.config.data, "proxy", ""):

@@ -12,6 +12,7 @@ class ImageRecord:
     source: str                 # bing / local / custom_urls
     source_id: str              # 来源侧唯一 ID（本地为文件绝对路径）
     remote_url: str = ""        # 远程下载地址（本地为空）
+    fallback_url: str = ""      # 远程地址失败时的备用地址（如 Bzee 的缩略图）
     local_path: str = ""        # 本机已落盘的图片路径
     title: str = ""
     author: str = ""

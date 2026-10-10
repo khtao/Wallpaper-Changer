@@ -1,12 +1,12 @@
 ; Wallpaper Changer —— Inno Setup 安装脚本
-; 用法: ISCC /DMyAppVersion=1.0.0 installer.iss
+; 用法: ISCC /DMyAppVersion=1.1.3 installer.iss
+;       （build.bat / build.ps1 会自动传版本号）
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.1.3"
 #endif
 
 #define MyAppName "Wallpaper Changer"
 #define MyAppPublisher "Wallpaper Changer"
-#define MyAppURL "https://github.com/example/wallpaper-changer"
 #define MyAppExeName "Wallpaper Changer.exe"
 #define MyBuildDir "dist\Wallpaper Changer"
 
@@ -16,12 +16,11 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-AppPublisherURL={#MyAppURL}
-AppSupportURL={#MyAppURL}
-AppUpdatesURL={#MyAppURL}
-DefaultDirName={autopf}\{#MyAppName}
+; 装到当前用户目录，无需管理员权限（壁纸应用属个人软件，够用且不会弹 UAC）
+DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+DisableDirPage=yes
 LicenseFile=
 OutputDir=dist
 OutputBaseFilename=WallpaperChanger-{#MyAppVersion}-Setup
@@ -32,14 +31,18 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
-PrivilegesRequiredOverridesAllowed=dialog
-; 允许无需管理员安装到用户目录
+; 不需要管理员：装到 %LOCALAPPDATA%\Programs 下
 PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
 ChangesAssociations=no
+; 单实例：避免重复安装时启动多个安装器
+SetupMutex=WallpaperChangerSetupMutex
+; 覆盖旧版本文件
+Uninstallable=yes
 
 [Languages]
-Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"; Flags: unchecked
@@ -51,6 +54,7 @@ Source: "{#MyBuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
+; 开机启动走「启动」文件夹（HKCU Run 也可，但文件夹方式用户可见、易管理）
 Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; \
       Parameters: "--minimized"; Tasks: startup
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
@@ -61,7 +65,6 @@ Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 {#MyAppName}"; \
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{userstartup}\{#MyAppName}.lnk"
-Type: filesandordirs; Name: "{userappdata}\WallpaperChanger"
 
 [Code]
 function InitializeSetup(): Boolean;
@@ -69,14 +72,38 @@ begin
   Result := True;
 end;
 
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+{ 卸载前结束正在运行的进程，避免 exe / dll 被占用导致删不掉 }
+function IsAppRunning(): Boolean;
 var
   ResultCode: Integer;
 begin
-  { 卸载前结束正在运行的进程，避免文件被占用 }
+  Result := False;
+  if ShellExec('open', 'taskkill.exe', '/F /IM "{#MyAppExeName}" /T',
+               '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Result := (ResultCode = 0);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  DataDir: String;
+begin
   if CurUninstallStep = usUninstall then
   begin
-    ShellExec('open', 'taskkill.exe', '/F /IM "Wallpaper Changer.exe" /T',
-              '', SW_HIDE, ewNoWait, ResultCode);
+    { 先结束进程，否则 exe / dll 被占用删不掉 }
+    IsAppRunning();
+
+    { 数据在 %APPDATA%\WallpaperChanger（缓存、历史、配置、日志）。
+      重装时往往希望保留，所以这里询问，而不是默默删掉。 }
+    DataDir := ExpandConstant('{userappdata}\WallpaperChanger');
+    if DirExists(DataDir) then
+    begin
+      if MsgBox('是否删除本机的配置、壁纸缓存和历史记录？' + #13#10 + #13#10 +
+                DataDir + #13#10 + #13#10 +
+                '选择「否」将保留这些数据（方便以后重新安装时继续使用）。',
+                mbConfirmation, MB_YESNO) = IDYES then
+      begin
+        DelTree(DataDir, True, True, True);
+      end;
+    end;
   end;
 end;
