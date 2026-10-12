@@ -211,6 +211,8 @@ class BzeeSource(Source):
 
         seen: set = set()
         for url in targets:
+            if getattr(self, "cancelled", lambda: False)():
+                break
             if len(result.images) >= limit:
                 break
             html = self._get(url, errors)
@@ -245,6 +247,8 @@ class BzeeSource(Source):
         """抓取一个页面；网络抖动时自动重试，403 判定为不可恢复直接放弃。"""
         last = ""
         for attempt in range(1, self.retries + 1):
+            if getattr(self, "cancelled", lambda: False)():
+                return ""
             try:
                 resp = self.session().get(
                     url, timeout=self.timeout(),

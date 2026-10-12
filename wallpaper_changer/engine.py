@@ -5,6 +5,7 @@ import logging
 import random
 import time
 from collections import deque
+from pathlib import Path
 from typing import Deque, List, Optional
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
@@ -39,7 +40,11 @@ class ApplyTask(QThread):
 
     def run(self) -> None:  # pragma: no cover - 需要线程环境
         try:
-            path = self.fetcher.ensure_local(self.record)
+            if isinstance(self.fetcher, Fetcher):
+                path = self.fetcher.ensure_local(
+                    self.record, cancelled=self.isInterruptionRequested)
+            else:  # 第三方 Fetcher / 单元测试替身
+                path = self.fetcher.ensure_local(self.record)
             # 兜底拿到的是缩略图时（如 Bzee 原图不可用），分辨率往往只有几百像素，
             # 直接设为壁纸会非常糊 —— 这里判定为失败，让引擎自动换下一张。
             w, h = self.record.width, self.record.height
@@ -70,14 +75,21 @@ class RefreshTask(QThread):
         records: List[ImageRecord] = []
         errors: List[str] = []
         for src in build_sources(self.config):
+            if self.isInterruptionRequested():
+                return
             try:
+                src.cancelled = self.isInterruptionRequested
                 res = src.fetch(limit=self.limit)
                 if res.error:
                     errors.append(f"{src.label}：{res.error}")
                 records.extend(res.images)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{src.label}：{exc}")
-        self.result.emit(records, "；".join(errors))
+            finally:
+                if hasattr(src, "close"):
+                    src.close()
+        if not self.isInterruptionRequested():
+            self.result.emit(records, "；".join(errors))
 
 
 # --------------------------------------------------------------------------- #
@@ -105,6 +117,7 @@ class Engine(QObject):
         self.current: Optional[ImageRecord] = None
         self._stack: List[ImageRecord] = []      # 已应用历史（用于“上一张”）
         self._refreshing = False
+        self._refresh_requested = False
         self._applying = False
         self._favorite_only = False
         # 运行时暂停：默认 False，即启动后自动开始倒计时。
@@ -113,6 +126,7 @@ class Engine(QObject):
         self._timer = QTimer(self)
         self._timer.timeout.connect(lambda: self.change_next(reason="定时"))
         self._tasks: List[QThread] = []
+        self._shutting_down = False
         self.last_refresh: float = 0.0
         self.apply_timer()
 
@@ -160,7 +174,11 @@ class Engine(QObject):
 
     # ---------- 候选池 ----------
     def refresh_pool(self, force: bool = False) -> None:
+        if self._shutting_down:
+            return
         if self._refreshing:
+            if force:
+                self._refresh_requested = True
             return
         if not force and self.pool and time.time() - self.last_refresh < 60:
             return
@@ -175,17 +193,27 @@ class Engine(QObject):
 
     def _on_refreshed(self, records: List[ImageRecord], error: str) -> None:
         self._refreshing = False
+        if self._shutting_down:
+            return
         self.refreshing.emit(False)
         self.last_refresh = time.time()
         rot = self.config.data.rotation
-        recent = self.db.recently_used_source_ids(rot.avoid_repeat_days)
+        try:
+            recent = self.db.recently_used_source_ids(rot.avoid_repeat_days)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("读取去重历史失败：%s", exc)
+            recent = set()
         saved: List[ImageRecord] = []
         for rec in records:
             if rec.width and rec.height and (
                 rec.width < rot.min_width or rec.height < rot.min_height
             ):
                 continue
-            saved.append(self.db.upsert(rec))
+            try:
+                saved.append(self.db.upsert(rec))
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("保存来源图片信息失败：%s", exc)
+                saved.append(rec)
         candidates = [r for r in saved if (r.source, r.source_id) not in recent]
         if not candidates:
             candidates = saved  # 全用过了就放宽
@@ -199,6 +227,9 @@ class Engine(QObject):
             self.failed.emit(error)
         self.status.emit(msg)
         self.refresh_finished.emit(len(self.pool), error)
+        if self._refresh_requested and not self._shutting_down:
+            self._refresh_requested = False
+            self.refresh_pool(force=True)
 
     # ---------- 切换 ----------
     def restore_current(self) -> Optional[ImageRecord]:
@@ -211,6 +242,8 @@ class Engine(QObject):
         if rec is None:
             return None
         self.current = rec
+        if rec.local_path:
+            self.fetcher.protected_paths = {Path(rec.local_path)}
         self.changed.emit(rec)
         self.status.emit(f"当前壁纸：{rec.display_title}")
         return rec
@@ -218,6 +251,8 @@ class Engine(QObject):
     def change_next(self, reason: str = "手动", favorite_only: bool | None = None) -> None:
         if favorite_only is not None:
             self._favorite_only = favorite_only
+        if self._shutting_down:
+            return
         if self._applying:
             self.status.emit("正在切换中，请稍候…")
             return
@@ -229,7 +264,7 @@ class Engine(QObject):
         self._start_apply(rec, reason)
 
     def apply_record(self, rec: ImageRecord, reason: str = "手动选择") -> None:
-        if self._applying:
+        if self._applying or self._shutting_down:
             return
         self._start_apply(rec, reason)
 
@@ -246,18 +281,28 @@ class Engine(QObject):
 
     def _on_applied(self, rec: ImageRecord, ok: bool, message: str) -> None:
         self._applying = False
+        if self._shutting_down:
+            return
         if not ok:
             self.failed.emit(f"设置壁纸失败：{message}")
             self.status.emit("设置失败，尝试下一张…")
             if self.pool:
                 self._start_apply(self.pool.popleft(), "失败重试")
             return
-        rec = self.db.upsert(rec)
-        self.db.mark_used(rec.id, True, message, rec.source, rec.display_title, rec.local_path)
+        try:
+            rec = self.db.upsert(rec)
+            self.db.mark_used(rec.id, True, message, rec.source,
+                              rec.display_title, rec.local_path)
+        except Exception as exc:  # noqa: BLE001
+            # 墙纸已成功设置，数据库写失败不能使 UI 假报设置失败或抛出信号异常。
+            LOG.exception("记录壁纸历史失败")
+            self.failed.emit(f"壁纸已更换，但历史记录保存失败：{exc}")
         if self.current is not None:
             self._stack.append(self.current)
             self._stack = self._stack[-50:]
         self.current = rec
+        if rec.local_path:
+            self.fetcher.protected_paths = {Path(rec.local_path)}
         self.changed.emit(rec)
         self.status.emit(f"已应用：{rec.display_title}（{rec.source}）")
         # 换完一张就从头开始计时，避免刚换完没多久又被自动换掉
@@ -327,13 +372,18 @@ class Engine(QObject):
         self.status.emit("已切换为仅轮换收藏" if enabled else "恢复全部图片轮换")
 
     def shutdown(self) -> None:
-        """退出前停止线程与定时器。"""
+        """先取消后等待工作线程结束，不能让仍运行的 QThread 被 Qt 销毁。"""
+        self._shutting_down = True
         self._timer.stop()
         for task in list(self._tasks):
-            if hasattr(task, "stop"):
-                task.stop()
+            task.requestInterruption()
+        for task in list(self._tasks):
             if task.isRunning():
-                task.wait(1000)
+                task.wait()  # 避免 QThread: Destroyed while thread is still running
+        self._tasks.clear()
+        self._refresh_requested = False
+        self._refreshing = False
+        self._applying = False
 
     def reload(self) -> None:
         self.fetcher.cache_dir = self.config.cache_dir

@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import tempfile
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QRect, QRectF, QSize, Qt, QThread, Signal, QObject
 from PySide6.QtGui import (
-    QAction, QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette,
+    QImageReader, QAction, QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette,
     QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..fetcher import Fetcher
+from ..qt_utils import thread_is_running, stop_thread
 from ..models import ImageRecord
 
 LOG = logging.getLogger(__name__)
@@ -51,6 +54,40 @@ PIX_CACHE_MAX = 64
 
 THUMB_W, THUMB_H = (THUMB_SIZES[DEFAULT_THUMB_SIZE][0],
                     THUMB_SIZES[DEFAULT_THUMB_SIZE][2] + TEXT_HEIGHT + 12)
+
+
+def load_pixmap(path: str, max_size: QSize | None = None):
+    """加载图片为 QPixmap：Qt 优先，解不开时用 Pillow 兜底。
+
+    网络图片在入缓存时已统一转码为 JPEG，理论上 Qt 一定能打开；
+    这里保留兜底是为了本地文件夹来源（可能是 webp / avif 等各种格式）。
+    失败返回 None。
+    """
+    # 先在解码器阶段降采样，避免 4K/8K 图片转成全尺寸 QPixmap 占几百 MB。
+    max_size = max_size or QSize(2560, 1600)
+    try:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        original = reader.size()
+        if original.isValid() and (original.width() > max_size.width()
+                                   or original.height() > max_size.height()):
+            scaled = original.scaled(max_size, Qt.KeepAspectRatio)
+            reader.setScaledSize(scaled)
+        image = reader.read()
+        if not image.isNull():
+            return QPixmap.fromImage(image)
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("Qt 解码失败 %s: %s", path, exc)
+    try:
+        from PIL import Image
+        from PIL.ImageQt import ImageQt
+        with Image.open(path) as im:
+            im.draft("RGB", (max_size.width(), max_size.height()))
+            im.thumbnail((max_size.width(), max_size.height()), Image.Resampling.LANCZOS)
+            return QPixmap.fromImage(ImageQt(im.convert("RGBA")))
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("Pillow 解码失败 %s: %s", path, exc)
+        return None
 
 
 class ThumbLoader(QThread):
@@ -76,22 +113,31 @@ class ThumbLoader(QThread):
             if self._stop:
                 return
             dest = thumb_path(self.fetcher, key)
-            if dest.exists():
+            if dest.is_file() and dest.stat().st_size > 0:
                 self.ready.emit(key, str(dest))
                 continue
             try:
-                src = self.fetcher.ensure_local(rec)
-                with Image.open(src) as im:
-                    im = im.convert("RGB")
-                    # 只按宽度缩放、高度自适应 —— 完整保留原图比例，不做任何裁切
-                    if im.width > THUMB_SOURCE_WIDTH:
-                        ratio = THUMB_SOURCE_WIDTH / im.width
-                        im = im.resize(
-                            (THUMB_SOURCE_WIDTH, max(1, int(im.height * ratio))),
-                            Image.LANCZOS,
-                        )
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    im.save(dest, "JPEG", quality=88, optimize=True)
+                src = self.fetcher.ensure_local(
+                    self.fetcher.thumbnail_record(rec), cancelled=lambda: self._stop)
+                if self._stop:
+                    return
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                temp = None
+                try:
+                    with Image.open(src) as im:
+                        # JPEG decoder 可以直接以低分辨率读取，减少峰值内存。
+                        im.draft("RGB", (THUMB_SOURCE_WIDTH, 1600))
+                        im.thumbnail((THUMB_SOURCE_WIDTH, 1600), Image.Resampling.LANCZOS)
+                        fd, temp = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
+                        with os.fdopen(fd, "wb") as out:
+                            im.convert("RGB").save(out, "JPEG", quality=86)
+                    if self._stop:
+                        return
+                    os.replace(temp, dest)
+                    temp = None
+                finally:
+                    if temp:
+                        Path(temp).unlink(missing_ok=True)
                 self.ready.emit(key, str(dest))
             except Exception as exc:  # noqa: BLE001
                 LOG.debug("生成缩略图失败 %s: %s", rec.display_title, exc)
@@ -155,10 +201,10 @@ class ThumbDelegate(QStyledItemDelegate):
         pix = self._cache.get(key)
         if pix is not None:
             return pix
-        pm = QPixmap(path)
-        if pm.isNull():
+        # 在解码阶段缩放，减少大缩略图瞬时内存峰值。
+        pm = load_pixmap(path, box)
+        if pm is None or pm.isNull():
             return None
-        # 只缩到不超过框，绝不放大填充、绝不裁切
         pm = pm.scaled(box, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self._cache[key] = pm
         self._order.append(key)
@@ -265,6 +311,31 @@ class ThumbDelegate(QStyledItemDelegate):
                      box.top() + (box.height() - h) // 2, w, h)
 
 
+class ImageActionTask(QThread):
+    """完整图查看/导出操作的后台 IO；UI 主线程只负责显示。"""
+
+    done = Signal(str, object, str, str)  # action, record, path, error
+
+    def __init__(self, fetcher: Fetcher, rec: ImageRecord, action: str,
+                 dest: str = "", parent=None):
+        super().__init__(parent)
+        self.fetcher, self.rec, self.action, self.dest = fetcher, rec, action, dest
+
+    def run(self) -> None:  # pragma: no cover
+        try:
+            path = self.fetcher.ensure_full_image(
+                self.rec, cancelled=self.isInterruptionRequested)
+            if self.isInterruptionRequested():
+                return
+            if self.action == "export":
+                path = str(self.fetcher.export_to(self.rec, Path(self.dest)))
+            self.done.emit(self.action, self.rec, path, "")
+        except InterruptedError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(self.action, self.rec, "", str(exc))
+
+
 class GalleryView(QWidget):
     """历史 / 收藏 / 全部 图片网格：筛选 + 自绘缩略图 + 右键菜单。"""
 
@@ -284,7 +355,12 @@ class GalleryView(QWidget):
         super().__init__(parent)
         self.fetcher = fetcher
         self.records: Dict[str, ImageRecord] = {}
+        self._items_by_key: Dict[str, QListWidgetItem] = {}
         self._loader: ThumbLoader | None = None
+        self._pending_jobs: List[tuple] | None = None
+        self._closing = False
+        self._clear_thumbs_pending = False
+        self._action_task = None
         self._thumb_paths: Dict[str, str] = {}
         try:
             purge_stale_thumb_cache(fetcher)   # 清掉旧参数生成的缩略图
@@ -367,25 +443,28 @@ class GalleryView(QWidget):
         self.reloadRequested.emit()
 
     def rebuild_thumbnails(self) -> None:
-        """清空缩略图缓存并重新加载。"""
-        purge_thumb_cache(self.fetcher)
+        """等待上一轮工作停止后再清缓存，不破坏正在写入的缩略图。"""
+        self._clear_thumbs_pending = True
         self._thumb_paths = {}
-        if hasattr(self, "delegate"):
-            self.delegate.invalidate()
+        self.delegate.invalidate()
         self.reload()
 
     def shutdown(self) -> None:
-        """退出前停掉后台线程，避免出现“线程仍在运行”的告警。"""
-        loader = self._loader
-        if loader is not None and loader.isRunning():
-            loader.stop()
-            loader.wait(2000)
+        """必须等待后台线程真正退出，避免 QThread 活着被 Python 回收。"""
+        self._closing = True
+        self._pending_jobs = None
+        if thread_is_running(self._loader):
+            self._loader.stop()
+            self._loader.wait()
+        if self._action_task is not None:
+            stop_thread(self._action_task)
 
     def set_records(self, records: List[ImageRecord]) -> None:
-        if self._loader and self._loader.isRunning():
-            self._loader.stop()
-            self._loader.wait(200)
+        if self._closing:
+            return
         self.list.clear()
+        self._items_by_key = {}
+        self.delegate.invalidate()
         self._thumb_paths = {}
         self.records = {thumb_key(r): r for r in records}
         jobs = []
@@ -398,14 +477,39 @@ class GalleryView(QWidget):
             item.setToolTip(self._tooltip(rec))
             item.setSizeHint(self.list.gridSize())
             self.list.addItem(item)
+            self._items_by_key[key] = item
             jobs.append((rec, key))
         self.label_count.setText(f"{len(records)} 张")
         self.countChanged.emit(len(records))
         self._sync_apply_button()
         self._apply_filter()
-        self._loader = ThumbLoader(self.fetcher, jobs)
-        self._loader.ready.connect(self._on_thumb)
-        self._loader.start()
+        # 合并频繁刷新请求。旧线程只请求停止、绝不在 UI 线程 wait(200)
+        # 后丢引用；等完成后只运行最后一次请求。
+        self._pending_jobs = jobs
+        if thread_is_running(self._loader):
+            self._loader.stop()
+            return
+        self._launch_loader()
+
+    def _launch_loader(self) -> None:
+        if self._closing or self._pending_jobs is None:
+            return
+        jobs, self._pending_jobs = self._pending_jobs, None
+        if self._clear_thumbs_pending:
+            purge_thumb_cache(self.fetcher)
+            self._clear_thumbs_pending = False
+        loader = ThumbLoader(self.fetcher, jobs, self)
+        self._loader = loader
+        loader.ready.connect(self._on_thumb)
+        loader.finished.connect(lambda t=loader: self._loader_finished(t))
+        loader.finished.connect(loader.deleteLater)
+        loader.start()
+
+    def _loader_finished(self, loader: ThumbLoader) -> None:
+        if self._loader is loader:
+            self._loader = None
+        if not self._closing and self._pending_jobs is not None:
+            self._launch_loader()
 
     def _title(self, rec: ImageRecord) -> str:
         title = rec.display_title
@@ -426,12 +530,12 @@ class GalleryView(QWidget):
         return "\n".join(lines)
 
     def _on_thumb(self, key: str, path: str) -> None:
+        if self._closing or self.sender() is not self._loader or key not in self.records:
+            return
         self._thumb_paths[key] = path
-        for i in range(self.list.count()):
-            item = self.list.item(i)
-            if item.data(self.ROLE_KEY) == key:
-                item.setData(self.ROLE_PATH, path)
-                return
+        item = self._items_by_key.get(key)
+        if item is not None:
+            item.setData(self.ROLE_PATH, path)
 
     def _apply_filter(self, _text: str = "") -> None:
         text = self.edit_search.text().strip().lower()
@@ -493,27 +597,54 @@ class GalleryView(QWidget):
 
     # ---------- 完整大图 ----------
     def _view_full(self, rec: Optional[ImageRecord]) -> None:
-        """双击 / 菜单：弹出窗口完整显示这张图（等比缩放，不裁切）。"""
+        """已缓存的立即显示；网络下载异步完成，避免 UI 无响应。"""
         if rec is None:
             return
-        try:
-            path = self.fetcher.ensure_local(rec)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "无法查看", f"图片不可用：{exc}")
-            return
-        pix = QPixmap(str(path))
-        if pix.isNull():
-            QMessageBox.warning(self, "无法查看", "无法读取该图片文件")
-            return
+        path = self.fetcher.resolve_full_image(rec)
+        if path:
+            self._show_full_image(rec, path)
+        else:
+            self._start_action("view", rec)
 
+    def _show_full_image(self, rec: ImageRecord, path: str) -> None:
         screen = self.screen() or QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else None
-        max_w = int(avail.width() * 0.86) if avail else 1400
-        max_h = int(avail.height() * 0.86) if avail else 900
-        self._last_full_pix = pix
-        self._last_full_rec = rec
+        max_w = max(300, int(avail.width() * 0.86)) if avail else 1400
+        max_h = max(200, int(avail.height() * 0.86)) if avail else 900
+        dpr = max(1.0, self.devicePixelRatioF())
+        pix = load_pixmap(str(path), QSize(int(max_w * dpr), int(max_h * dpr)))
+        if pix is None or pix.isNull():
+            QMessageBox.warning(self, "无法查看", "无法读取该图片文件")
+            return
         dlg = FullImageDialog(pix, max_w, max_h, rec, self)
         dlg.exec()
+
+    def _start_action(self, action: str, rec: ImageRecord, dest: str = "") -> None:
+        if thread_is_running(self._action_task):
+            self.label_count.setText("另一项图片操作正在进行…")
+            return
+        task = ImageActionTask(self.fetcher, rec, action, dest, self)
+        self._action_task = task
+        self.label_count.setText("正在下载图片…")
+        task.done.connect(self._action_done)
+        task.finished.connect(lambda t=task: self._action_finished(t))
+        task.finished.connect(task.deleteLater)
+        task.start()
+
+    def _action_done(self, action: str, rec: ImageRecord, path: str, error: str) -> None:
+        if self._closing:
+            return
+        self._apply_filter()
+        if error:
+            QMessageBox.warning(self, "图片操作失败", error)
+        elif action == "view":
+            self._show_full_image(rec, path)
+        else:
+            QMessageBox.information(self, "已保存", f"已保存到：\n{path}")
+
+    def _action_finished(self, task) -> None:
+        if self._action_task is task:
+            self._action_task = None
 
     def _open(self, rec: ImageRecord) -> None:
         url = rec.webpage or rec.remote_url
@@ -527,47 +658,71 @@ class GalleryView(QWidget):
 
     def _export(self, rec: ImageRecord) -> None:
         dest = QFileDialog.getExistingDirectory(self, "选择保存目录")
-        if not dest:
-            return
-        try:
-            path = self.fetcher.export_to(rec, Path(dest))
-            QMessageBox.information(self, "已保存", f"已保存到：\n{path}")
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "保存失败", str(exc))
+        if dest:
+            self._start_action("export", rec, dest)
 
     def _copy(self, text: str) -> None:
         QApplication.clipboard().setText(text)
 
 
+class FullImageCanvas(QWidget):
+    """在实际可见区域直接绘制高清 QPixmap，不预先制成一次性小图。
+
+    旧版在滚动容器尚未完成布局时读取 viewport().size()，把已经
+    解码好的原图缩成几百像素的 QLabel pixmap；之后视口变大，画面
+    仍是那张低清小图。这里每次 paint 都以最终画布大小计算绘制矩形。
+    """
+
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self._image = pixmap
+        self.setMinimumSize(160, 100)
+        self.setAutoFillBackground(True)
+        self.setToolTip(f"预览图片：{pixmap.width()} × {pixmap.height()} 像素（按窗口大小等比显示）")
+
+    @property
+    def image_size(self) -> QSize:
+        return self._image.size()
+
+    def image_draw_rect(self) -> QRectF:
+        """画布逻辑像素内图片应占据的真实区域，可用于 GUI 回归测试。"""
+        available = self.size()
+        if available.width() <= 0 or available.height() <= 0 or self._image.isNull():
+            return QRectF()
+        fitted = self._image.size().scaled(available, Qt.KeepAspectRatio)
+        x = (available.width() - fitted.width()) / 2.0
+        y = (available.height() - fitted.height()) / 2.0
+        return QRectF(x, y, fitted.width(), fitted.height())
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.black)
+        if not self._image.isNull():
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawPixmap(self.image_draw_rect(), self._image,
+                               QRectF(self._image.rect()))
+        painter.end()
+
+
 class FullImageDialog(QDialog):
-    """完整显示一张图：窗口变化时始终等比缩放，绝不裁切。"""
+    """图库双击弹窗：读取原图缓存，按当前窗口尺寸实时清晰绘制。"""
 
     def __init__(self, pixmap: QPixmap, max_w: int, max_h: int,
                  rec: ImageRecord | None = None, parent=None):
         super().__init__(parent)
-        self._pix = pixmap
+        self._pix = pixmap  # 保存真实解码分辨率；不替换为低分辨率缩放副本
         self._max_w, self._max_h = max_w, max_h
         self.rec = rec
         self.setWindowTitle(
             f"{rec.display_title} · {rec.resolution}" if rec else "完整图片")
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        self.label = QLabel()
-        self.label.setAlignment(Qt.AlignCenter)
-        self.label.setPixmap(self._scaled())
-        area = QScrollArea(self)
-        area.setWidgetResizable(True)
-        area.setWidget(self.label)
-        lay.addWidget(area)
-        size = self._scaled().size()
-        self.resize(min(size.width() + 28, max_w), min(size.height() + 60, max_h))
-
-    def _scaled(self) -> QPixmap:
-        return self._pix.scaled(QSize(self._max_w, self._max_h),
-                                Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        # 窗口尺寸变化时重新按当前视口等比缩放，保证永远完整可见
-        if hasattr(self, "label"):
-            self.label.setPixmap(self._scaled())
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.canvas = FullImageCanvas(pixmap, self)
+        layout.addWidget(self.canvas, 1)
+        wanted = pixmap.size().scaled(
+            QSize(max(1, max_w), max(1, max_h)), Qt.KeepAspectRatio)
+        # 直接按可用屏幕初始化弹窗，不再依赖未布局的 QScrollArea viewport。
+        self.resize(max(320, min(wanted.width(), max_w)),
+                    max(200, min(wanted.height(), max_h)))
+        self.setMinimumSize(min(320, max_w), min(200, max_h))

@@ -5,24 +5,27 @@ import logging
 from pathlib import Path
 from typing import List
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, QSize
 from PySide6.QtWidgets import QApplication  # noqa: F401  （发现分类时刷新界面）
 from PySide6.QtGui import QAction, QCloseEvent, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPlainTextEdit,
+    QPlainTextEdit, QGridLayout, QSizePolicy, QBoxLayout, QScrollArea,
     QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget, QDoubleSpinBox,
 )
 
 from ..config import Config, IS_WINDOWS, fit_modes_for_platform
 from ..database import Database
 from ..models import ImageRecord
+from ..qt_utils import stop_thread, thread_is_running
 from ..wallpaper import detect_desktop, screen_info
 from ..sources.bzee import (
     DESKTOP_CATEGORIES, MOBILE_CATEGORIES, POPULAR_KEYWORDS, BzeeSource,
 )
-from .gallery import GalleryView
+from ..sources.qh360 import BUILTIN_CATEGORIES as QH360_CATEGORIES, Qh360Source
+from .gallery import GalleryView, load_pixmap
+from .wheel_guard import WheelSettingGuard
 
 LOG = logging.getLogger(__name__)
 
@@ -39,11 +42,93 @@ class _PreviewLoader(QThread):
 
     def run(self) -> None:  # pragma: no cover - 线程环境
         try:
-            path = self.fetcher.ensure_local(self.rec)
+            path = self.fetcher.ensure_local(
+                self.rec, cancelled=self.isInterruptionRequested)
             self.done.emit(path)
         except Exception as exc:  # noqa: BLE001
             LOG.debug("预览图下载失败：%s", exc)
             self.done.emit("")
+
+
+class _DiscoverTask(QThread):
+    done = Signal(object)
+
+    def __init__(self, settings, config, parent=None):
+        super().__init__(parent)
+        self.settings, self.config = settings, config
+
+    def run(self) -> None:  # pragma: no cover
+        src = BzeeSource(self.settings, self.config)
+        try:
+            found = src.discover_categories()
+            if not self.isInterruptionRequested():
+                self.done.emit(found)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("Bzee 分类发现异常：%s", exc)
+            if not self.isInterruptionRequested():
+                self.done.emit({})
+        finally:
+            src.close()
+
+
+class _Discover360Task(QThread):
+    """后台读取 360 分类，网络失败不能阻塞主界面。"""
+    done = Signal(object, str)
+
+    def __init__(self, settings, config, parent=None):
+        super().__init__(parent)
+        self.settings, self.config = settings, config
+
+    def run(self) -> None:  # pragma: no cover
+        source = Qh360Source(self.settings, self.config)
+        try:
+            categories = source.discover_categories()
+            if not self.isInterruptionRequested():
+                self.done.emit(categories, "" if categories else "API 未返回分类")
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("360 壁纸分类接口失败：%s", exc)
+            if not self.isInterruptionRequested():
+                self.done.emit({}, str(exc))
+        finally:
+            source.close()
+
+
+class _CacheMaintenanceTask(QThread):
+    """维护缓存使用独立线程，不在 GUI 主线程遍历/解码几百张图片。"""
+
+    done = Signal(str, int, int, str)  # mode, count, removed, error
+
+    def __init__(self, fetcher, mode: str, parent=None):
+        super().__init__(parent)
+        self.fetcher, self.mode = fetcher, mode
+
+    def run(self) -> None:  # pragma: no cover
+        try:
+            if self.mode == "migrate":
+                converted, removed = self.fetcher.migrate_cache_to_jpeg(
+                    cancelled=self.isInterruptionRequested)
+                if not self.isInterruptionRequested():
+                    self.done.emit(self.mode, converted, removed, "")
+                return
+            bad = scanned = 0
+            for p in Path(self.fetcher.cache_dir).rglob("*"):
+                if self.isInterruptionRequested():
+                    return
+                if (not p.is_file() or p.suffix.lower() in (".part", ".tmp")
+                        or p in self.fetcher.protected_paths):
+                    continue
+                scanned += 1
+                try:
+                    if not self.fetcher.is_valid_cached(p):
+                        p.unlink()
+                        bad += 1
+                except OSError:
+                    pass
+            self.done.emit(self.mode, scanned, bad, "")
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("缓存维护异常")
+            if not self.isInterruptionRequested():
+                self.done.emit(self.mode, 0, 0, str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -60,8 +145,17 @@ class MainWindow(QMainWindow):
         self.engine = ctx.engine
         self._closing = False
         self.setWindowTitle("Wallpaper Changer · 自动壁纸")
-        self.resize(980, 720)
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        # Qt6 已按逻辑像素处理 DPI；按屏幕可用尺寸限制窗口，避免缩放 200% 时越界。
+        self.resize(max(320, min(980, avail.width() - 24)) if avail else 980,
+                    max(320, min(720, avail.height() - 24)) if avail else 720)
+        self._preview_path = ""
+        self._preview_pending = None
         self._build_ui()
+        # 滚轮用于翻动页面，不允许意外改写下拉框或数值设置。
+        self._wheel_setting_guard = WheelSettingGuard(self)
+        self._wheel_setting_guard.install_on(self)
         self._load_settings()
         self._connect_engine()
         self._tick = QTimer(self)
@@ -78,9 +172,12 @@ class MainWindow(QMainWindow):
         root.setSpacing(8)
 
         # --- 顶部：当前壁纸 ---
-        top = QHBoxLayout()
+        top = QBoxLayout(QBoxLayout.LeftToRight)
+        self._top_layout = top
         self.preview = QLabel()
-        self.preview.setFixedSize(300, 170)
+        self.preview.setMinimumSize(160, 96)
+        self.preview.setMaximumSize(300, 170)
+        self.preview.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setStyleSheet(
             "background:#202124;color:#9aa0a6;border:1px solid #444;border-radius:6px;")
@@ -101,29 +198,30 @@ class MainWindow(QMainWindow):
         info.addWidget(self.label_meta)
         info.addStretch(1)
 
-        btns = QHBoxLayout()
+        btns = QGridLayout()
         self.btn_prev = QPushButton("← 上一张")
         self.btn_next = QPushButton("下一张 →")
         self.btn_fav = QPushButton("★ 收藏")
         self.btn_refresh = QPushButton("↻ 抓取新图")
-        for b in (self.btn_prev, self.btn_next, self.btn_fav, self.btn_refresh):
-            btns.addWidget(b)
+        for i, b in enumerate((self.btn_prev, self.btn_next,
+                               self.btn_fav, self.btn_refresh)):
+            btns.addWidget(b, i // 2, i % 2)
         self.btn_prev.clicked.connect(self.engine.change_prev)
         self.btn_next.clicked.connect(lambda: self.engine.change_next("手动"))
         self.btn_fav.clicked.connect(self._toggle_fav)
         self.btn_refresh.clicked.connect(lambda: self.engine.refresh_pool(force=True))
         info.addLayout(btns)
         top.addLayout(info, 1)
-        root.addLayout(top, 1)
+        root.addLayout(top, 0)
 
         # --- 标签页 ---
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_general_tab(), "轮换")
-        self.tabs.addTab(self._build_sources_tab(), "图片来源")
+        self.tabs.addTab(self._scroll_tab(self._build_general_tab()), "轮换")
+        self.tabs.addTab(self._scroll_tab(self._build_sources_tab()), "图片来源")
         # 收藏与历史合并为同一个「图库」选项卡，用筛选下拉切换范围
         self.gallery = GalleryView(self.engine.fetcher)
         self.tabs.addTab(self.gallery, "图库")
-        self.tabs.addTab(self._build_advanced_tab(), "高级")
+        self.tabs.addTab(self._scroll_tab(self._build_advanced_tab()), "高级")
         self.tabs.addTab(self._build_about_tab(), "关于")
         root.addWidget(self.tabs, 3)
 
@@ -149,6 +247,36 @@ class MainWindow(QMainWindow):
         self.gallery.reloadRequested.connect(self.refresh_views)
         self.gallery.combo_mode.setCurrentText(self.gallery_mode)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    @staticmethod
+    def _scroll_tab(content: QWidget) -> QScrollArea:
+        """设置项较多的页面允许双向滚动，200%/300% 缩放下不丢操作控件。"""
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(content)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        area.setFrameShape(QScrollArea.NoFrame)
+        return area
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        layout = getattr(self, "_top_layout", None)
+        if layout is not None:
+            desired = (QBoxLayout.TopToBottom if self.width() < 700
+                       else QBoxLayout.LeftToRight)
+            if layout.direction() != desired:
+                layout.setDirection(desired)
+        # QLabel 的图片已限定了解码尺寸；窗口尺寸变化时只重用缓存文件。
+        if getattr(self, "_preview_path", "") and hasattr(self, "preview"):
+            if not getattr(self, "_preview_resize_pending", False):
+                self._preview_resize_pending = True
+                QTimer.singleShot(0, self._refresh_preview_after_resize)
+
+    def _refresh_preview_after_resize(self) -> None:
+        self._preview_resize_pending = False
+        if self._preview_path and not self._closing:
+            self._set_preview_pixmap(self._preview_path)
 
     # ---------- 轮换 ----------
     def _build_general_tab(self) -> QWidget:
@@ -264,6 +392,39 @@ class MainWindow(QMainWindow):
         f.addRow("拉取天数：", self.spin_bing_count)
         f.addRow("分辨率：", self.combo_bing_res)
         lay.addWidget(gb)
+
+        # 360 高清壁纸：接口历史较久，独立开关，不能影响其它来源
+        gb360 = QGroupBox("360 高清壁纸（历史接口，可能已停止维护）")
+        gb360.setCheckable(True)
+        self.gb_360 = gb360
+        v360 = QVBoxLayout(gb360)
+        self.combo_360_mode = QComboBox()
+        self.combo_360_mode.addItem("按分类抓取", "category")
+        self.combo_360_mode.addItem("最近更新", "latest")
+        self.combo_360_mode.currentIndexChanged.connect(self._360_mode_changed)
+        fm360 = QFormLayout()
+        fm360.addRow("获取模式：", self.combo_360_mode)
+        self.spin_360_count = QSpinBox()
+        self.spin_360_count.setRange(1, 50)
+        self.spin_360_pages = QSpinBox()
+        self.spin_360_pages.setRange(1, 5)
+        fm360.addRow("每页数量：", self.spin_360_count)
+        fm360.addRow("抓取页数：", self.spin_360_pages)
+        v360.addLayout(fm360)
+        row360 = QHBoxLayout()
+        self.btn_360_refresh = QPushButton("在线更新分类")
+        self.btn_360_refresh.clicked.connect(self._360_discover)
+        self.label_360_status = QLabel("旧接口可能不可用；未选分类时按最近更新抓取")
+        self.label_360_status.setStyleSheet("color:#8a8f98;")
+        row360.addWidget(self.btn_360_refresh)
+        row360.addWidget(self.label_360_status, 1)
+        v360.addLayout(row360)
+        self.list_360_cat = QListWidget()
+        self.list_360_cat.setSelectionMode(QListWidget.MultiSelection)
+        self.list_360_cat.setToolTip("Ctrl / Shift 多选分类；未选则抓取最近更新。")
+        v360.addWidget(self.list_360_cat)
+        self._360_fill_categories()
+        lay.addWidget(gb360)
 
         # Bzee 图库
         gbz = QGroupBox("Bzee 图库（photo.bzee.cn · 4K 高清）")
@@ -424,10 +585,17 @@ class MainWindow(QMainWindow):
             "删除缓存目录里无法解码的文件（如站点返回的错误页）。\n"
             "若预览显示「无法解码」，点这里可一次性清干净。")
         self.btn_purge_bad.clicked.connect(self._purge_bad_cache)
+        self.btn_to_jpg = QPushButton("缓存转 JPG")
+        self.btn_to_jpg.setToolTip(
+            "把缓存里残留的非 JPEG 图片（webp/png 等）统一转码为 JPEG。\n"
+            "网络图片下载时已自动转码，这个按钮用于清理历史遗留文件；\n"
+            "启动时会后台自动跑一次。")
+        self.btn_to_jpg.clicked.connect(self._migrate_cache)
         self.btn_reset = QPushButton("恢复默认设置")
         self.btn_reset.clicked.connect(self._reset_settings)
         v3.addWidget(self.btn_clear_history)
         v3.addWidget(self.btn_purge_bad)
+        v3.addWidget(self.btn_to_jpg)
         v3.addWidget(self.btn_reset)
         v3.addStretch(1)
         lay.addWidget(g3)
@@ -511,6 +679,16 @@ class MainWindow(QMainWindow):
         self._set_int(self.spin_bing_count, d.bing.count, 8)
         self._set_combo(self.combo_bing_res, d.bing.resolution)
 
+        s360 = getattr(d, "qh360", None)
+        if s360 is not None:
+            self._set_checked(self.gb_360, s360.enabled, False)
+            mode_idx = self.combo_360_mode.findData(s360.mode)
+            self.combo_360_mode.setCurrentIndex(max(0, mode_idx))
+            self._set_int(self.spin_360_count, s360.page_size, 24)
+            self._set_int(self.spin_360_pages, s360.max_pages, 1)
+            self._360_fill_categories(set(s360.categories or []))
+            self._360_mode_changed()
+
         bz = getattr(d, "bzee", None)
         if bz is not None:
             self._set_checked(self.gb_bzee, bz.enabled, False)
@@ -567,6 +745,14 @@ class MainWindow(QMainWindow):
         d.bing.market = self.combo_market.currentText().strip() or "zh-CN"
         d.bing.count = self.spin_bing_count.value()
         d.bing.resolution = self.combo_bing_res.currentText()
+
+        s360 = getattr(d, "qh360", None)
+        if s360 is not None:
+            s360.enabled = self.gb_360.isChecked()
+            s360.mode = self.combo_360_mode.currentData() or "category"
+            s360.page_size = self.spin_360_count.value()
+            s360.max_pages = self.spin_360_pages.value()
+            s360.categories = self._360_selected_categories()
 
         bz = getattr(d, "bzee", None)
         if bz is not None:
@@ -644,9 +830,11 @@ class MainWindow(QMainWindow):
             self.edit_cache.setText(str(Path(d) / "cache"))
 
     def _clear_cache(self) -> None:
-        self.engine.fetcher.clear()
+        removed = self.engine.fetcher.clear()
         self._update_cache_label()
-        QMessageBox.information(self, "完成", "缓存已清空")
+        QMessageBox.information(self, "完成",
+            f"已清理 {removed} 个缓存文件。当前壁纸和正在下载的文件已保留。")
+        self.refresh_views()
 
     def _update_cache_label(self) -> None:
         try:
@@ -758,18 +946,17 @@ class MainWindow(QMainWindow):
         self._start_preview_loader(rec)
 
     def _set_preview_pixmap(self, path: str) -> None:
-        pix = QPixmap(path)
-        if pix.isNull():
-            # Qt 解不开时用 Pillow 兜底（对 webp 等格式兼容性更好），
-            # 转成 QImage 再显示，避免直接报「无法解码」。
-            pix = self._decode_with_pil(path)
+        self._preview_path = path
+        dpr = max(1.0, self.devicePixelRatioF())
+        size = QSize(max(1, int(self.preview.width() * dpr)),
+                     max(1, int(self.preview.height() * dpr)))
+        pix = load_pixmap(path, size)
         if pix is None or pix.isNull():
             self.preview.setText("预览图无法解码")
             return
-        # QLabel 同时有 text 与 pixmap 时 pixmap 优先，这里顺手清空文本
         self.preview.setText("")
-        self.preview.setPixmap(pix.scaled(
-            self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.preview.setPixmap(pix.scaled(self.preview.size(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     @staticmethod
     def _decode_with_pil(path: str):
@@ -793,45 +980,83 @@ class MainWindow(QMainWindow):
     def _start_preview_loader(self, rec: ImageRecord) -> None:
         """后台下载预览图，避免界面卡住。"""
         prev = getattr(self, "_preview_loader", None)
-        if prev is not None and prev.isRunning():
-            return          # 已有任务在跑，不重复发起
+        if thread_is_running(prev):
+            self._preview_pending = rec
+            return          # 旧任务完成后加载最新一张
         fetcher = getattr(self.engine, "fetcher", None)
         if fetcher is None:
             return
         loader = _PreviewLoader(fetcher, rec)
-        loader.done.connect(self._on_preview_loaded)
+        loader.done.connect(lambda path, r=rec: self._on_preview_loaded(path, r))
+        loader.finished.connect(lambda t=loader: self._preview_finished(t))
+        loader.finished.connect(loader.deleteLater)
         self._preview_loader = loader
         loader.start()
 
-    def _on_preview_loaded(self, path: str) -> None:
+    def _on_preview_loaded(self, path: str, rec: ImageRecord | None = None) -> None:
+        if self._closing or (rec is not None and self.engine.current is not None
+                and (rec.source, rec.source_id) !=
+                    (self.engine.current.source, self.engine.current.source_id)):
+            return
         if path:
             self._set_preview_pixmap(path)
         else:
-            # 下载失败（如站点 403）：保持标题等元信息可见，不再谎报「未设置」
             self.preview.setText("预览图暂时无法加载")
 
+    def _preview_finished(self, loader: QThread) -> None:
+        if getattr(self, "_preview_loader", None) is loader:
+            self._preview_loader = None
+        pending, self._preview_pending = self._preview_pending, None
+        if pending is not None and not self._closing:
+            self._start_preview_loader(pending)
+
     def _purge_bad_cache(self) -> None:
-        """扫描缓存目录，删除无法解码的文件（错误页、截断的文件等）。"""
-        fetcher = getattr(self.engine, "fetcher", None)
-        root = Path(fetcher.cache_dir) if fetcher else None
-        if root is None or not root.exists():
+        self._run_maintenance("purge")
+
+    def _migrate_cache(self) -> None:
+        self._run_maintenance("migrate")
+
+    def _run_maintenance(self, mode: str) -> None:
+        existing = getattr(self, "_maintenance_task", None)
+        if thread_is_running(existing):
+            self.label_status.setText("已有缓存维护任务在运行")
             return
-        bad = 0
-        total = 0
-        for p in root.rglob("*"):
-            if not p.is_file():
-                continue
-            total += 1
-            try:
-                if not fetcher.is_valid_cached(p):
-                    p.unlink()
-                    bad += 1
-            except OSError:
-                pass
+        startup_migration = getattr(self.ctx, "_migrate_task", None)
+        if thread_is_running(startup_migration):
+            self.label_status.setText("启动缓存迁移尚未结束，请稍后重试")
+            return
+        self.btn_purge_bad.setEnabled(False)
+        self.btn_to_jpg.setEnabled(False)
+        self.label_status.setText("正在后台迁移缓存…" if mode == "migrate"
+                                  else "正在后台检查缓存…")
+        task = _CacheMaintenanceTask(self.engine.fetcher, mode, self)
+        self._maintenance_task = task
+        task.done.connect(self._on_maintenance_done)
+        task.finished.connect(lambda t=task: self._maintenance_finished(t))
+        task.finished.connect(task.deleteLater)
+        task.start()
+
+    def _on_maintenance_done(self, mode: str, count: int,
+                              removed: int, error: str) -> None:
+        if self._closing:
+            return
+        if error:
+            msg = f"缓存维护失败：{error}"
+        elif mode == "migrate":
+            msg = f"缓存转码完成：{count} 张已转为 JPEG，清理 {removed} 个无效文件"
+        else:
+            msg = f"缓存检查完成：清理 {removed} 个无效文件（共扫描 {count} 个）"
+        self.label_status.setText(msg)
+        self.append_log(msg)
         self._update_cache_label()
-        self.label_status.setText(
-            f"已清理 {bad} 个无效缓存文件（共扫描 {total} 个）")
-        self.append_log(f"清理无效缓存：删除 {bad}/{total} 个文件")
+        self.refresh_views()
+
+    def _maintenance_finished(self, task: QThread) -> None:
+        if getattr(self, "_maintenance_task", None) is task:
+            self._maintenance_task = None
+        if not self._closing:
+            self.btn_purge_bad.setEnabled(True)
+            self.btn_to_jpg.setEnabled(True)
 
     def _clear_preview(self) -> None:
         """确无当前壁纸时才回到初始文案。"""
@@ -865,6 +1090,58 @@ class MainWindow(QMainWindow):
         self._update_countdown()
 
     # ---------- Bzee ----------
+    def _360_selected_categories(self) -> List[str]:
+        return [str(self.list_360_cat.item(i).data(Qt.UserRole))
+                for i in range(self.list_360_cat.count())
+                if self.list_360_cat.item(i).isSelected()]
+
+    def _360_fill_categories(self, selected=None) -> None:
+        if selected is None:
+            selected = set(self._360_selected_categories())
+        selected = {str(x) for x in selected}
+        self.list_360_cat.clear()
+        # 旧配置里有新分类 ID 时仍可显示，不会因为网络不可用丢设置。
+        mapping = dict(QH360_CATEGORIES)
+        mapping.update({cid: f"分类 {cid}" for cid in selected if cid not in mapping})
+        for cid, name in mapping.items():
+            item = QListWidgetItem(f"{name}（{cid}）")
+            item.setData(Qt.UserRole, cid)
+            item.setSelected(cid in selected)
+            self.list_360_cat.addItem(item)
+
+    def _360_mode_changed(self, *_args) -> None:
+        self.list_360_cat.setEnabled(self.combo_360_mode.currentData() == "category")
+
+    def _360_discover(self) -> None:
+        if self._closing or getattr(self, "_discover_360_task", None) is not None:
+            return
+        self.btn_360_refresh.setEnabled(False)
+        self.label_360_status.setText("正在更新分类…")
+        task = _Discover360Task(self.config.data.qh360, self.config, self)
+        self._discover_360_task = task
+        task.done.connect(self._360_discover_done)
+        task.finished.connect(lambda t=task: self._360_discover_finished(t))
+        task.finished.connect(task.deleteLater)
+        task.start()
+
+    def _360_discover_finished(self, task: QThread) -> None:
+        if getattr(self, "_discover_360_task", None) is task:
+            self._discover_360_task = None
+        if not self._closing:
+            self.btn_360_refresh.setEnabled(True)
+
+    def _360_discover_done(self, found: dict, error: str) -> None:
+        if self._closing:
+            return
+        if not found:
+            self.label_360_status.setText(
+                f"分类请求失败：{error[:110]}；可继续使用内置分类")
+            return
+        selected = set(self._360_selected_categories())
+        QH360_CATEGORIES.update(found)
+        self._360_fill_categories(selected)
+        self.label_360_status.setText(f"在线更新成功：{len(found)} 个分类")
+
     def _bzee_lib_changed(self) -> None:
         """切换图库时重建分类列表（保留仍存在的勾选）。"""
         lib = self.combo_bzee_lib.currentData() or "desktop"
@@ -884,25 +1161,32 @@ class MainWindow(QMainWindow):
             self.list_bzee_cat.item(i).setSelected(select)
 
     def _bzee_discover(self) -> None:
-        """联网抓取站点真实分类，替换内置列表（内置 slug 未经站点验证）。"""
+        """分类发现异步运行，WAF/超时不会冻结整个窗口。"""
+        if getattr(self, "_discover_task", None) is not None:
+            return
         self.btn_bzee_disc.setEnabled(False)
         self.label_bzee_disc.setText("正在抓取 photo.bzee.cn …")
-        QApplication.processEvents()
-        try:
-            src = BzeeSource(self.config.data.bzee)
-            found = src.discover_categories()
-        except Exception as exc:  # noqa: BLE001
-            found = {}
-            LOG.warning("Bzee 分类发现异常：%s", exc)
-        finally:
+        task = _DiscoverTask(self.config.data.bzee, self.config, self)
+        self._discover_task = task
+        task.done.connect(self._bzee_discover_done)
+        task.finished.connect(lambda t=task: self._discover_finished(t))
+        task.finished.connect(task.deleteLater)
+        task.start()
+
+    def _discover_finished(self, task: QThread) -> None:
+        if getattr(self, "_discover_task", None) is task:
+            self._discover_task = None
+        if not self._closing:
             self.btn_bzee_disc.setEnabled(True)
 
+    def _bzee_discover_done(self, found: dict) -> None:
+        if self._closing:
+            return
         got = {k: v for k, v in (found or {}).items() if v}
         if not got:
             self.label_bzee_disc.setText(
                 "未取到在线分类（站点可能拒绝了该请求），继续使用内置列表")
             return
-        # 用在线结果替换内置表，让界面与实际链接一致
         for lib, mapping in got.items():
             table = DESKTOP_CATEGORIES if lib == "desktop" else MOBILE_CATEGORIES
             table.clear()
@@ -951,7 +1235,17 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def shutdown(self) -> None:
-        """退出前停掉界面侧的后台线程。"""
+        """请求取消并收拢界面线程，防止退出时 QThread 仍在运行。"""
+        self._closing = True
+        self._tick.stop()
+        loader = getattr(self, "_preview_loader", None)
+        stop_thread(loader)
+        maintenance = getattr(self, "_maintenance_task", None)
+        stop_thread(maintenance)
+        discover = getattr(self, "_discover_task", None)
+        stop_thread(discover)
+        discover360 = getattr(self, "_discover_360_task", None)
+        stop_thread(discover360)
         view = getattr(self, "gallery", None)
         if view is not None:
             view.shutdown()

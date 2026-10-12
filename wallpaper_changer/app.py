@@ -5,17 +5,19 @@ import argparse
 import logging
 import os
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtNetwork import QHostAddress, QTcpServer
-from PySide6.QtWidgets import QApplication, QStyleFactory
+from PySide6.QtWidgets import QApplication, QStyleFactory, QSystemTrayIcon
 
 from . import autostart
 from .config import APP_NAME, APP_TITLE, IS_WINDOWS, VERSION, Config, app_data_dir
 from .database import Database
 from .engine import Engine
 from .ipc import InstanceLock, pick_free_port, process_alive, send_command
+from .qt_utils import stop_thread
 from .ui.icons import app_icon
 from .ui.main_window import MainWindow
 from .ui.tray import TrayIcon
@@ -80,13 +82,36 @@ def setup_logging(level: str = "INFO") -> Path:
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
     for h in list(root.handlers):
         root.removeHandler(h)
-    fh = logging.FileHandler(path, encoding="utf-8")
+    fh = RotatingFileHandler(path, maxBytes=5 * 1024 * 1024,
+                             backupCount=3, encoding="utf-8")
     fh.setFormatter(fmt)
     root.addHandler(fh)
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     root.addHandler(sh)
     return path
+
+
+class CacheMigrateTask(QThread):
+    """启动时后台把缓存里的非 JPEG 图片统一转码为 JPEG。
+
+    老版本缓存里可能残留 webp / png —— 正是双击大图显示不出来的那些文件。
+    放在后台线程跑，避免几百张 4K 图转码时卡住界面。
+    """
+
+    done = Signal(int, int)     # converted, removed
+
+    def __init__(self, engine: Engine, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+
+    def run(self) -> None:  # pragma: no cover - 线程环境
+        try:
+            converted, removed = self.engine.fetcher.migrate_cache_to_jpeg(
+                cancelled=self.isInterruptionRequested)
+            self.done.emit(int(converted), int(removed))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("缓存转码失败：%s", exc)
 
 
 class Application(QObject):
@@ -105,6 +130,8 @@ class Application(QObject):
         self.tray: TrayIcon | None = None
         self._server: QTcpServer | None = None
         self.lock: InstanceLock | None = None
+        self._quitting = False
+        self._migrate_task: CacheMigrateTask | None = None
 
     # ---------- CLI ----------
     @staticmethod
@@ -218,7 +245,10 @@ class Application(QObject):
         if desktop_entry_installed():
             qt_app.setDesktopFileName(APP_NAME)
         qt_app.setWindowIcon(app_icon())
-        qt_app.setQuitOnLastWindowClosed(False)
+        tray_supported = (not self.args.no_tray and
+                          QSystemTrayIcon.isSystemTrayAvailable())
+        # 无托盘时关闭窗口应正常退出，否则会留下无法恢复的隐藏进程。
+        qt_app.setQuitOnLastWindowClosed(not tray_supported)
         self.apply_theme(self.config.data.theme)
 
         if self.args.next or self.args.prev or self.args.refresh:
@@ -231,12 +261,15 @@ class Application(QObject):
             LOG.info("已恢复当前壁纸显示：%s", restored.display_title)
         else:
             LOG.info("尚无历史记录，首页显示未设置壁纸")
-        if not self.args.no_tray:
+        if tray_supported:
             self.tray = TrayIcon(self)
-        if not self.args.minimized and not self.config.data.start_minimized:
+        elif not self.args.no_tray:
+            LOG.warning("系统托盘不可用，将显示窗口以避免后台进程不可访问")
+        if not tray_supported or (not self.args.minimized and
+                                  not self.config.data.start_minimized):
             self.window.show()
         else:
-            LOG.info("以最小化方式启动")
+            LOG.info("以托盘方式启动")
 
         # 关键：启动后显式按配置装好倒计时。
         # 暂停只是运行时状态（不落盘），因此每次启动都会回到配置里的
@@ -255,8 +288,23 @@ class Application(QObject):
         if self.config.data.rotation.on_startup_change:
             self.engine.change_next("启动")
         self.engine.refresh_pool()
+        self._migrate_cache()
         LOG.info("启动完成，日志：%s", self.log_path)
         return qt_app.exec()
+
+    def _migrate_cache(self) -> None:
+        """后台把历史缓存里的非 JPEG 图片转码为 JPEG。"""
+        try:
+            task = CacheMigrateTask(self.engine, self)
+            task.done.connect(
+                lambda c, r: LOG.info("缓存转码：%d 张已转为 JPEG，清理 %d 个无效文件", c, r)
+                if (c or r) else None)
+            # 不调用 deleteLater：退出流程仍需要访问这个 QThread。
+            # QObject 父对象 Application 会在最终销毁时自动释放它。
+            self._migrate_task = task
+            task.start()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("缓存转码任务启动失败：%s", exc)
 
     def _run_headless(self, qt_app: QApplication) -> int:
         """命令行一次性操作：换图 / 刷新图池。"""
@@ -265,6 +313,8 @@ class Application(QObject):
         holder = {"done": False, "ok": True}
 
         def finish(ok: bool = True) -> None:
+            if holder["done"]:
+                return
             holder["done"] = True
             holder["ok"] = ok
             try:
@@ -296,13 +346,15 @@ class Application(QObject):
             self.engine.refresh_finished.connect(lambda n, err: finish(n > 0))
             QTimer.singleShot(100, lambda: self.engine.refresh_pool(force=True))
 
-        QTimer.singleShot(60000, lambda: finish(False))   # 超时保护
+        QTimer.singleShot(90000, lambda: finish(False) if not holder["done"] else None)
+        # --prev 没有历史时应立即退出，不应空等超时。
+        if self.args.prev:
+            self.engine.status.connect(
+                lambda m: finish(False) if m == "没有更早的历史了" and not holder["done"] else None)
         qt_app.exec()
         print("完成" if holder["ok"] else f"失败：{state['error'] or '超时或无可用图片'}")
-        # 一次性命令直接结束进程，避免 Qt 在解释器清理阶段释放资源产生告警
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0 if holder["ok"] else 1)
+        # 正常返回并由 main() 的 finally 完成清理，不使用 os._exit 强杀进程。
+        return 0 if holder["ok"] else 1
 
     # ---------- 主题 ----------
     def apply_theme(self, theme: str) -> None:
@@ -365,21 +417,46 @@ class Application(QObject):
             LOG.warning("安装菜单项失败：%s", exc)
 
     def quit(self) -> None:
+        """幂等退出：个别 Qt 包装对象已删除时仍须走完剩余清理。"""
+        if self._quitting:
+            return
+        self._quitting = True
         LOG.info("退出应用")
-        if self.window is not None and hasattr(self.window, "shutdown"):
+        try:
+            if self.window is not None:
+                try:
+                    self.window.shutdown()
+                except Exception:  # noqa: BLE001
+                    LOG.exception("关闭界面后台任务失败")
+            # 旧版本可能在 QThread.finished 中 deleteLater() 了 C++ 对象，
+            # Python 引用不等于对象存活。stop_thread 对悬空包装对象是安全的。
             try:
-                self.window.shutdown()
+                stop_thread(self._migrate_task)
+                self._migrate_task = None
             except Exception:  # noqa: BLE001
-                pass
-        if self.engine:
-            self.engine.shutdown() if hasattr(self.engine, "shutdown") else None
-        if self._server:
-            self._server.close()
-        if self.lock is not None:
-            self.lock.release()
-        app = QApplication.instance()
-        if app:
-            app.quit()
+                LOG.exception("停止缓存迁移任务失败")
+            try:
+                self.engine.shutdown()
+            except Exception:  # noqa: BLE001
+                LOG.exception("停止轮换引擎失败")
+            if self._server is not None:
+                try:
+                    self._server.close()
+                except Exception:  # noqa: BLE001
+                    LOG.exception("关闭本地命令服务失败")
+            try:
+                self.db.close()
+            except Exception:  # noqa: BLE001
+                LOG.exception("关闭数据库失败")
+            if self.lock is not None:
+                try:
+                    self.lock.release()
+                except Exception:  # noqa: BLE001
+                    LOG.exception("释放单实例锁失败")
+        finally:
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -415,12 +492,15 @@ def main(argv: list[str] | None = None) -> int:
     if not ctx.try_single_instance():
         return 0
 
+    # --quit 在没有运行实例时应直接结束，而不是启动一个新的托盘程序。
+    if args.quit:
+        ctx.lock.release()
+        return 0
     install_qt_message_filter()
     app = QApplication(argv)
     ctx.start_command_server()
     try:
         code = ctx.run(app)
     finally:
-        if ctx.lock is not None:
-            ctx.lock.release()
+        ctx.quit()
     return code

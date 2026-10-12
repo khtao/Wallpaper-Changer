@@ -70,8 +70,8 @@ def main() -> int:
     seen = {"pool": 0, "failed": 0, "applied": 0}
     engine.pool_updated.connect(lambda n: seen.__setitem__("pool", n))
     engine.failed.connect(lambda m: (seen.__setitem__("failed", seen["failed"] + 1), print("  [failed]", m)))
-    engine.changed.connect(lambda rec, reason: (seen.__setitem__("applied", seen["applied"] + 1),
-                                                print("  [changed]", rec.display_title, reason)))
+    engine.changed.connect(lambda rec: (seen.__setitem__("applied", seen["applied"] + 1),
+                                                print("  [changed]", rec.display_title)))
     engine.status.connect(lambda m: print("  [status]", m))
 
     print("== refresh_pool ==")
@@ -121,6 +121,28 @@ def main() -> int:
         win.tabs.setCurrentIndex(i)
         app.processEvents()
     win.refresh_views()
+    # 360 来源分类 / 最近更新及配置读写，不需要访问网络。
+    from wallpaper_changer.sources.qh360 import BUILTIN_CATEGORIES
+    assert not win.gb_360.isChecked()
+    assert win.list_360_cat.count() >= len(BUILTIN_CATEGORIES)
+    win.gb_360.setChecked(True)
+    win.combo_360_mode.setCurrentIndex(win.combo_360_mode.findData("category"))
+    win.list_360_cat.clearSelection()
+    win.list_360_cat.item(0).setSelected(True)
+    selected_360 = win._360_selected_categories()
+    assert len(selected_360) == 1
+    win.spin_360_count.setValue(12)
+    win.spin_360_pages.setValue(2)
+    win._collect_settings()
+    assert win.config.data.qh360.enabled is True
+    assert win.config.data.qh360.categories == selected_360
+    assert win.config.data.qh360.page_size == 12
+    assert win.config.data.qh360.max_pages == 2
+    win.combo_360_mode.setCurrentIndex(win.combo_360_mode.findData("latest"))
+    assert not win.list_360_cat.isEnabled()
+    win.combo_360_mode.setCurrentIndex(win.combo_360_mode.findData("category"))
+    assert win.list_360_cat.isEnabled()
+    win.gb_360.setChecked(False)
     win._collect_settings()
     assert win.config.data.local.directories == [str(pics)]
     print("  五个标签页切换 + 设置读写正常（收藏/历史已合并为图库）")
@@ -144,12 +166,17 @@ def main() -> int:
         rec = ImageRecord(source="local", source_id=str(src),
                           local_path=str(src), title=f"{w}x{h}", width=w, height=h)
         dlg = FullImageDialog(QPixmap(str(src)), 1400, 900, rec)
-        shown = dlg.label.pixmap()
-        rel = abs((w / h) - (shown.width() / shown.height())) / (w / h)
-        assert rel <= 0.01, f"大图弹窗变形：{w}x{h} -> {shown.width()}x{shown.height()}"
-        assert shown.width() <= 1400 and shown.height() <= 900
-        assert not dlg.label.hasScaledContents(), "不允许拉伸填充"
-        print(f"  {w}x{h} -> {shown.width()}x{shown.height()} 误差 {rel:.2%} OK")
+        # 不能再依赖 QLabel 在布局前生成的低清缩放副本。
+        dlg.show()
+        app.processEvents()
+        actual = dlg.canvas.image_draw_rect()
+        rel = abs((w / h) - (actual.width() / actual.height())) / (w / h)
+        assert rel <= 0.01, f"大图弹窗变形：{w}x{h} -> {actual.width()}x{actual.height()}"
+        assert actual.width() <= 1400 and actual.height() <= 900
+        assert actual.width() > 200, "大图不应被固定为缩略图尺寸"
+        assert dlg.canvas.image_size == QPixmap(str(src)).size(), "必须保留解码后的高清像素"
+        print(f"  {w}x{h} -> {actual.width():.0f}x{actual.height():.0f} 误差 {rel:.2%} OK")
+        dlg.close()
 
     print("== 显示方式默认完整 ==")
     assert cfg.data.rotation.fit_mode == "适应（完整显示）", cfg.data.rotation.fit_mode
@@ -191,9 +218,62 @@ def main() -> int:
     bad.write_bytes(b'{"error":403}')
     assert hasattr(win, "btn_purge_bad")
     win._purge_bad_cache()
+    import time as _time
+    _deadline = _time.monotonic() + 10
+    while (bad.exists() and _time.monotonic() < _deadline):
+        app.processEvents()
+        _time.sleep(.02)
+    app.processEvents()
     assert good.exists(), "正常图片不应被删"
     assert not bad.exists(), "无效文件应被清理"
     print("  无效缓存已清理，正常文件保留 ✅")
+
+    print("== 缓存统一转码为 JPEG ==")
+    from PIL import Image as _PILJ
+    import io as _io2
+
+    import wallpaper_changer.fetcher as _F
+    from wallpaper_changer.models import ImageRecord as _Rec
+
+    rec_w = _Rec(source="bzee", source_id="smoke-webp", title="webp 来源图",
+                 remote_url="https://imgtu.bzee.cn/photo/pic/smoke/x.webp")
+    _buf = _io2.BytesIO()
+    _PILJ.new("RGB", (900, 600), (120, 60, 30)).save(_buf, "WEBP")
+    _payload = _buf.getvalue()
+
+    class _R:
+        status_code = 200
+        headers = {"Content-Type": "image/webp"}
+        def raise_for_status(self): pass
+        def iter_content(self, _n): yield _payload
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+
+    _orig = _F.requests.get
+    _F.requests.get = lambda *a, **k: _R()
+    try:
+        p_w = Path(engine.fetcher.ensure_local(rec_w))
+    finally:
+        _F.requests.get = _orig
+
+    assert p_w.suffix.lower() == ".jpg", f"网络图片必须缓存为 jpg，实际 {p_w.suffix}"
+    with _PILJ.open(p_w) as _im:
+        assert _im.format == "JPEG", _im.format
+    print("  网络图片已缓存为 JPEG：", p_w.name)
+
+    # 迁移按钮：把残留 webp 转成 jpg
+    _old = engine.fetcher.target_path(rec_w).with_suffix(".webp")
+    _old.parent.mkdir(parents=True, exist_ok=True)
+    _old.write_bytes(_payload)
+    assert hasattr(win, "btn_to_jpg")
+    win._migrate_cache()
+    _deadline = _time.monotonic() + 10
+    while (_old.exists() and _time.monotonic() < _deadline):
+        app.processEvents()
+        _time.sleep(.02)
+    app.processEvents()
+    assert not _old.exists() and _old.with_suffix(".jpg").exists()
+    print("  历史 webp 缓存已转码 ✅")
 
     print("== 自动轮换默认自动切换 ==")
     cfg.data.rotation.enabled = True          # 冒烟里关过定时器，这里恢复
@@ -238,7 +318,13 @@ def main() -> int:
     win.preview.setText("尚未设置壁纸")
     rec_nocache = _Rec(source="bzee", source_id="nocache", title="无缓存图",
                        local_path="", remote_url="https://x/y/nocache.webp")
-    win._update_preview(rec_nocache)
+    # 只测占位文案，不向示例域名发真实网络请求。
+    _original_start = win._start_preview_loader
+    win._start_preview_loader = lambda rec: None
+    try:
+        win._update_preview(rec_nocache)
+    finally:
+        win._start_preview_loader = _original_start
     assert win.preview.text() != "尚未设置壁纸", win.preview.text()
     print("  无缓存时：", win.preview.text())
 
@@ -263,6 +349,7 @@ def main() -> int:
     print("== 图标 ==")
     assert not app_icon().isNull()
 
+    win.shutdown()
     engine.shutdown()
     db.close()
     print("\n全部冒烟通过 ✅")

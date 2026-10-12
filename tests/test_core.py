@@ -271,8 +271,8 @@ def test_sources_registry_contents():
 
     cfg = config_mod.Config()
     assert not hasattr(cfg.data, "openverse")
-    assert set(REGISTRY) == {"bing", "bzee", "local", "custom_urls"}
-    assert set(SOURCE_LABELS) == {"bing", "bzee", "local", "custom_urls"}
+    assert set(REGISTRY) == {"bing", "bzee", "qh360", "local", "custom_urls"}
+    assert set(SOURCE_LABELS) == {"bing", "bzee", "qh360", "local", "custom_urls"}
     # bzee 默认关闭，开启后才应出现在构建结果里
     names = [s.name for s in build_sources(cfg)]
     assert "openverse" not in names
@@ -722,3 +722,118 @@ def test_purge_bad_cache_keeps_valid_files(tmp_path):
     assert not (root / "bzee" / "bad1.webp").exists()
     eng.shutdown()
     db.close()
+
+
+def test_network_images_cached_as_jpeg(tmp_path):
+    """网络图片下载后必须转码为 JPEG 缓存（消除 webp 解不开的问题）。"""
+    import io
+
+    from PIL import Image
+
+    import wallpaper_changer.fetcher as fetcher_mod
+    from wallpaper_changer.models import ImageRecord as _IR  # noqa: F401
+
+    # 造一张真实的 webp 作为「下载内容」
+    buf = io.BytesIO()
+    Image.new("RGB", (300, 200), (120, 60, 30)).save(buf, "WEBP")
+    payload = buf.getvalue()
+
+    class Resp:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {"Content-Type": "image/webp"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, _n):
+            yield payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    orig_get, orig_sleep = fetcher_mod.requests.get, fetcher_mod.time.sleep
+    fetcher_mod.requests.get = lambda *a, **k: Resp()
+    fetcher_mod.time.sleep = lambda _s: None
+    try:
+        f = fetcher_mod.Fetcher(tmp_path / "cache", retries=1, retry_delay=0)
+        rec = ImageRecord(source="bzee", source_id="w1", title="webp 图",
+                          remote_url="https://imgtu.bzee.cn/photo/pic/x/y/1.webp")
+        path = Path(f.ensure_local(rec))
+    finally:
+        fetcher_mod.requests.get = orig_get
+        fetcher_mod.time.sleep = orig_sleep
+
+    assert path.exists()
+    assert path.suffix.lower() == ".jpg", f"缓存应为 jpg，实际 {path.suffix}"
+    with Image.open(path) as im:
+        assert im.format == "JPEG", f"内容应为 JPEG，实际 {im.format}"
+        assert im.size == (300, 200)
+    assert rec.local_path == str(path)
+
+
+def test_local_source_keeps_original_format(tmp_path):
+    """本地文件夹来源不转码（用户自己的图直接引用原件）。"""
+    from PIL import Image
+
+    src = tmp_path / "mine.png"
+    Image.new("RGB", (40, 30), (10, 20, 30)).save(src, "PNG")
+    f = Fetcher(tmp_path / "cache")
+    rec = ImageRecord(source="local", source_id=str(src), local_path=str(src))
+    assert f.ensure_local(rec) == str(src)
+    assert Path(rec.local_path).suffix == ".png"     # 未被改写
+
+
+def test_migrate_cache_to_jpeg(tmp_path):
+    """迁移：缓存里的 webp/png 转成 jpg，损坏文件删掉。"""
+    from PIL import Image
+
+    f = Fetcher(tmp_path / "cache")
+    root = Path(f.cache_dir)
+    (root / "bzee").mkdir(parents=True, exist_ok=True)
+
+    old_webp = root / "bzee" / "aaa.webp"
+    old_png = root / "bzee" / "bbb.png"
+    already = root / "bzee" / "ccc.jpg"
+    broken = root / "bzee" / "ddd.webp"
+    Image.new("RGB", (60, 40), (200, 100, 50)).save(old_webp, "WEBP")
+    Image.new("RGB", (60, 40), (10, 180, 90)).save(old_png, "PNG")
+    Image.new("RGB", (60, 40), (5, 5, 5)).save(already, "JPEG")
+    broken.write_bytes(b'{"error":403}')
+
+    converted, removed = f.migrate_cache_to_jpeg()
+    assert converted == 2, f"应转码 2 张，实际 {converted}"
+    assert removed == 1, f"应删除 1 个损坏文件，实际 {removed}"
+
+    assert not old_webp.exists() and (root / "bzee" / "aaa.jpg").exists()
+    assert not old_png.exists() and (root / "bzee" / "bbb.jpg").exists()
+    assert already.exists()             # 已是 jpg 的不动
+    assert not broken.exists()          # 损坏的清掉
+
+    with Image.open(root / "bzee" / "aaa.jpg") as im:
+        assert im.format == "JPEG"
+
+
+def test_migration_result_matches_target_path(tmp_path):
+    """迁移后的文件名必须能被 cached_path 命中（哈希相同、扩展名变 jpg）。"""
+    import io
+
+    from PIL import Image
+
+    f = Fetcher(tmp_path / "cache")
+    rec = ImageRecord(source="bzee", source_id="k1",
+                      remote_url="https://imgtu.bzee.cn/photo/pic/z/z/k1.webp")
+    # 模拟老版本留下的缓存：按旧规则（扩展名取自 URL）落在 .webp
+    old = f.target_path(rec).with_suffix(".webp")
+    old.parent.mkdir(parents=True, exist_ok=True)
+    buf = io.BytesIO()
+    Image.new("RGB", (80, 60), (70, 70, 70)).save(buf, "WEBP")
+    old.write_bytes(buf.getvalue())
+
+    assert f.cached_path(rec) is None       # 迁移前按 .jpg 找不到
+    f.migrate_cache_to_jpeg()
+    assert f.cached_path(rec) is not None   # 迁移后命中
+    assert f.resolve_local(rec) is not None

@@ -40,13 +40,28 @@ class Source:
         injected = getattr(self, "_session", None)
         if injected is not None:
             return injected
+        owned = getattr(self, "_owned_session", None)
+        if owned is not None:
+            return owned
         s = requests.Session()
+        self._owned_session = s
         s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
         if self.config and getattr(self.config.data, "proxy", ""):
             s.proxies.update(
                 {"http": self.config.data.proxy, "https": self.config.data.proxy}
             )
         return s
+
+    def close(self) -> None:
+        """释放 HTTP 连接池。外部注入的测试会话不由本类管理。"""
+        s = getattr(self, "_owned_session", None)
+        if s is not None:
+            try:
+                s.close()
+            finally:
+                self._owned_session = None
+                if getattr(self, "_session", None) is s:
+                    self._session = None
 
     def timeout(self) -> int:
         rot = getattr(self.config.data, "rotation", None) if self.config else None

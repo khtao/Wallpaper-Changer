@@ -84,6 +84,16 @@ class BingSettings:
 
 
 @dataclass
+class Qh360Settings:
+    """360 高清壁纸（历史公开接口，默认关闭避免不可用时拖慢启动）。"""
+    enabled: bool = False
+    mode: str = "category"  # category=指定分类 / latest=最近更新
+    categories: List[str] = field(default_factory=lambda: ["36"])
+    page_size: int = 24
+    max_pages: int = 1
+
+
+@dataclass
 class LocalSettings:
     enabled: bool = False
     directories: List[str] = field(default_factory=list)
@@ -126,6 +136,7 @@ class RotationSettings:
 class AppSettings:
     bing: BingSettings = field(default_factory=BingSettings)
     bzee: BzeeSettings = field(default_factory=BzeeSettings)
+    qh360: Qh360Settings = field(default_factory=Qh360Settings)
     local: LocalSettings = field(default_factory=LocalSettings)
     custom_urls: CustomUrlSettings = field(default_factory=CustomUrlSettings)
     rotation: RotationSettings = field(default_factory=RotationSettings)
@@ -224,6 +235,7 @@ class Config:
         self.data = AppSettings(
             bing=_from_dict(BingSettings, raw.get("bing", {})),
             bzee=_from_dict(BzeeSettings, raw.get("bzee", {})),
+            qh360=_from_dict(Qh360Settings, raw.get("qh360", {})),
             local=_from_dict(LocalSettings, raw.get("local", {})),
             custom_urls=_from_dict(CustomUrlSettings, raw.get("custom_urls", {})),
             rotation=_from_dict(RotationSettings, raw.get("rotation", {})),
@@ -267,6 +279,10 @@ class Config:
         names = []
         if self.data.bing.enabled:
             names.append("bing")
+        if self.data.bzee.enabled:
+            names.append("bzee")
+        if self.data.qh360.enabled:
+            names.append("qh360")
         if self.data.local.enabled:
             names.append("local")
         if self.data.custom_urls.enabled:
